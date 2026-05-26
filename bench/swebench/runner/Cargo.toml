@@ -1,0 +1,29 @@
+[package]
+name = "bench-swebench"
+version.workspace = true
+edition = "2024"
+license.workspace = true
+publish = false
+
+[[bin]]
+name = "bench-swebench"
+path = "src/main.rs"
+
+[dependencies]
+dirs = "6"
+lash-runtime = { git = "https://github.com/SamGalanakis/lash", rev = "711f993579536312d6b4e77fecae3d3e69d5a7f2", version = "=0.1.0-alpha.9" }
+lash-cli = { git = "https://github.com/SamGalanakis/lash", rev = "711f993579536312d6b4e77fecae3d3e69d5a7f2", version = "=0.1.0-alpha.9" }
+lash-standard-plugins = { git = "https://github.com/SamGalanakis/lash", rev = "711f993579536312d6b4e77fecae3d3e69d5a7f2", version = "=0.1.0-alpha.9" }
+lash-sqlite-store = { git = "https://github.com/SamGalanakis/lash", rev = "711f993579536312d6b4e77fecae3d3e69d5a7f2", version = "=0.1.0-alpha.9" }
+lash-llm-tools = { git = "https://github.com/SamGalanakis/lash", rev = "711f993579536312d6b4e77fecae3d3e69d5a7f2", version = "=0.1.0-alpha.9" }
+lash-providers-builtin = { git = "https://github.com/SamGalanakis/lash", rev = "711f993579536312d6b4e77fecae3d3e69d5a7f2", version = "=0.1.0-alpha.9" }
+lash-subagents = { git = "https://github.com/SamGalanakis/lash", rev = "711f993579536312d6b4e77fecae3d3e69d5a7f2", version = "=0.1.0-alpha.9" }
+tokio = { workspace = true, features = ["full"] }
+tokio-util = { workspace = true, features = ["rt"] }
+clap = { workspace = true, features = ["derive", "env"] }
+anyhow = { workspace = true }
+chrono = { workspace = true }
+serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true }
+async-trait = { workspace = true }
+dotenvy = "0.15"

@@ -1,0 +1,11 @@
+/target/
+/.lash-bin*/
+/.benchmarks/
+/jobs/
+__pycache__/
+*.py[cod]
+*.sqlite
+*.sqlite-*
+*.db
+*.log
+.env
