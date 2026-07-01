@@ -311,18 +311,31 @@ def load_provider_metadata(config_path: Path | None) -> dict[str, Any]:
     active_key = data.get("active_provider")
     providers = data.get("providers") or {}
     active = providers.get(active_key) or {}
+
+    def provider_kind(provider: Any) -> Any:
+        if not isinstance(provider, dict):
+            return None
+        if provider.get("type"):
+            return provider.get("type")
+        if provider.get("kind"):
+            return provider.get("kind")
+        config = provider.get("config")
+        if isinstance(config, dict):
+            return config.get("type") or config.get("kind")
+        return None
+
     available = []
     for name, provider in providers.items():
         available.append(
             {
                 "name": name,
-                "type": provider.get("type"),
+                "type": provider_kind(provider),
             }
         )
 
     return {
         "active_provider": active_key,
-        "active_provider_type": active.get("type"),
+        "active_provider_type": provider_kind(active),
         "available_providers": available,
     }
 

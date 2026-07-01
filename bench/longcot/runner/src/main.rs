@@ -12,8 +12,8 @@ use chrono::Utc;
 use clap::Parser;
 use dataset::{LongCoTQuestion, load_questions};
 use lash::{
-    LashCore, ModeId, ModePreset, PluginStack, SessionSpec, TurnInput,
-    advanced::{EventSink, ExecutionMode, TurnContext, TurnFinish, TurnOutcome, TurnStop},
+    ModelSpec, PluginStack, RlmCore, SessionSpec, TurnActivity, TurnActivitySink, TurnEvent,
+    TurnInput,
     prompt::{
         PromptBuiltin, PromptSlot, PromptTemplate, PromptTemplateEntry, PromptTemplateSection,
     },
@@ -21,13 +21,13 @@ use lash::{
     usage::{SessionUsageReport, TokenLedgerEntry, TokenUsage, diff_usage_reports},
 };
 use lash_cli::config::LashConfig;
-use lash_core::{InputItem, SessionEvent};
+use lash_core::{TestLocalProcessRegistry, TurnFinish, TurnOutcome, TurnStop};
 use lash_export::{ExportFormat, export};
 use lash_llm_tools::LlmToolsPluginFactory;
-use lash_mode_rlm::{RlmModePluginConfig, RlmPromptFeatures, RlmTurnInputExt};
-use lash_plugin_process_controls::ProcessControlsPluginFactory;
+use lash_plugin_process_controls::SessionProcessAdminPluginFactory;
+use lash_protocol_rlm::{RlmPromptFeatures, RlmProtocolPluginConfig, RlmTurnInputExt};
 use lash_provider_openai::OPENROUTER_BASE_URL;
-use lash_sqlite_store::{SqliteProcessRegistry, Store};
+use lash_sqlite_store::Store;
 use lash_subagents::{CapabilityRegistry, StaticCapability, SubagentsPluginFactory};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -274,7 +274,6 @@ async fn main() -> anyhow::Result<()> {
     // before anyone calls `LashConfig::build_active_provider`. Without this,
     // providers loaded from `~/.lash/config.json` fail with "provider X is
     // not registered."
-    lash_providers_builtin::register_all();
 
     let args = Args::parse();
 
@@ -311,7 +310,6 @@ async fn main() -> anyhow::Result<()> {
     fs::create_dir_all(&responses_dir)
         .with_context(|| format!("create {}", responses_dir.display()))?;
 
-    let execution_mode = ExecutionMode::new(EXECUTION_MODE_LABEL);
     let model_slug = args.model.replace(['/', ':'], "_");
     let domain_label = summarize_domain_selection(&args.domain);
     let diff_label = args.difficulty.clone().unwrap_or_else(|| "all".to_string());
@@ -419,14 +417,12 @@ async fn main() -> anyhow::Result<()> {
         let args = args_shared.clone();
         let output_dir = output_dir_shared.clone();
         let responses_path = responses_path_shared.clone();
-        let execution_mode = execution_mode.clone();
         join_set.spawn(async move {
             let _permit = permit;
             let result = run_question(
                 output_dir.as_ref(),
                 provider.as_ref(),
                 args.as_ref(),
-                execution_mode,
                 question,
             )
             .await;
@@ -571,7 +567,6 @@ async fn run_question(
     output_dir: &Path,
     provider: &ProviderHandle,
     args: &Args,
-    _execution_mode: ExecutionMode,
     question: LongCoTQuestion,
 ) -> anyhow::Result<QuestionResult> {
     let question_dir = output_dir.join("questions").join(&question.question_id);
@@ -584,32 +579,41 @@ async fn run_question(
     let store_path = question_dir.join("session.db");
     let trace_path = question_dir.join("session.trace.jsonl");
     let store = Arc::new(
-        Store::open(&store_path).with_context(|| format!("open {}", store_path.display()))?,
+        Store::open(&store_path)
+            .await
+            .with_context(|| format!("open {}", store_path.display()))?,
     );
 
-    let model_spec = lash::ModelSpec::from_token_limits(
+    let model_spec = ModelSpec::from_token_limits(
         args.model.clone(),
         Some(args.variant.clone()),
         args.max_context_tokens,
         None,
-        None,
     )
     .map_err(anyhow::Error::msg)?;
-    let core = LashCore::builder()
-        .install_mode(ModePreset::rlm_with_config(longcot_rlm_config()))
-        .default_mode(ModeId::rlm())
+    let core = RlmCore::builder()
+        .rlm_protocol_config(longcot_rlm_config())
         .provider(provider.clone())
         .model(model_spec)
         .max_turns(args.max_turns)
-        .prompt_template(longcot_prompt_template())
-        .trace_jsonl_path(Some(trace_path.clone()))
-        .process_registry(Arc::new(SqliteProcessRegistry::memory()?))
+        .store_factory(Arc::new(
+            lash::persistence::InMemorySessionStoreFactory::new(),
+        ))
+        .process_registry(Arc::new(TestLocalProcessRegistry::default()))
+        .process_env_store(Arc::new(
+            lash::persistence::InMemoryProcessExecutionEnvStore::new(),
+        ))
         .plugins(build_plugin_stack())
+        .effect_host(Arc::new(lash::durability::InlineEffectHost::default()))
+        .lashlang_artifact_store(Arc::new(
+            lash::persistence::InMemoryLashlangArtifactStore::new(),
+        ))
+        .attachment_store(Arc::new(lash::persistence::InMemoryAttachmentStore::new()))
+        .trace_jsonl_path(trace_path.clone())
         .build()?;
     let session = core
         .session("root")
-        .rlm()
-        .store(store.clone())
+        .store(store.clone() as Arc<dyn lash::persistence::RuntimePersistence>)
         .open()
         .await?;
 
@@ -617,23 +621,15 @@ async fn run_question(
     let started = std::time::Instant::now();
     let cancel = tokio_util::sync::CancellationToken::new();
     let sink = Arc::new(LongCoTEventSink::new(question_dir.join("events.jsonl"))?);
-    let sink_trait: Arc<dyn EventSink> = sink.clone();
+    let sink_trait: Arc<dyn TurnActivitySink> = sink.clone();
+    let mut input = TurnInput::text(LONGCOT_USER_DIRECTIVE.to_string())
+        .rlm_project(build_projected_bindings(&question)?)?;
+    input.trace_turn_id = None;
     let turn = session
-        .turn(
-            (TurnInput {
-                items: vec![InputItem::Text {
-                    text: LONGCOT_USER_DIRECTIVE.to_string(),
-                }],
-                image_blobs: Default::default(),
-                mode_turn_options: None,
-                trace_turn_id: None,
-                mode_extension: None,
-                turn_context: TurnContext::default(),
-            })
-            .rlm_project(build_projected_bindings(&question)?)?,
-        )
+        .turn(input)
         .cancel(cancel)
-        .collect_session_events_with(sink_trait.as_ref())
+        .prompt_template(longcot_prompt_template())
+        .stream_to(sink_trait.as_ref())
         .await
         .context("run longcot question")?;
     if args.await_background_work {
@@ -702,7 +698,9 @@ async fn run_question(
         &trace_path,
         ExportFormat::Html,
         Some(&html_trace_path),
-    ) {
+    )
+    .await
+    {
         eprintln!(
             "warn: failed to render HTML trace for {}: {err:#}",
             question.question_id
@@ -791,7 +789,9 @@ fn extract_text(content: Option<&Value>) -> String {
 fn build_plugin_stack() -> PluginStack {
     let mut stack = lash::plugins::runtime_plugin_stack();
     stack.push(Arc::new(LlmToolsPluginFactory::default()));
-    stack.push(Arc::new(ProcessControlsPluginFactory::list_only_for_rlm()));
+    stack.push(Arc::new(
+        SessionProcessAdminPluginFactory::without_cancel_process(),
+    ));
     stack.push(Arc::new(
         SubagentsPluginFactory::new(Arc::new(CapabilityRegistry::new().with(Arc::new(
             StaticCapability::new(SUBAGENT_CAPABILITY, SessionSpec::inherit()),
@@ -801,13 +801,13 @@ fn build_plugin_stack() -> PluginStack {
     stack
 }
 
-fn longcot_rlm_config() -> RlmModePluginConfig {
-    RlmModePluginConfig {
+fn longcot_rlm_config() -> RlmProtocolPluginConfig {
+    RlmProtocolPluginConfig {
         prompt_features: RlmPromptFeatures {
             images: false,
             ..RlmPromptFeatures::default()
         },
-        ..RlmModePluginConfig::default()
+        ..RlmProtocolPluginConfig::default()
     }
 }
 
@@ -886,8 +886,8 @@ Budget discipline: you have a 50-iteration root turn limit. One monolithic try t
 /// user message.
 fn build_projected_bindings(
     question: &LongCoTQuestion,
-) -> anyhow::Result<lash_mode_rlm::RlmProjectedBindings> {
-    Ok(lash_mode_rlm::RlmProjectedBindings::new()
+) -> anyhow::Result<lash_protocol_rlm::RlmProjectedBindings> {
+    Ok(lash_protocol_rlm::RlmProjectedBindings::new()
         .bind_json(
             "benchmark",
             json!({
@@ -984,13 +984,13 @@ fn read_env_var(name: &str) -> Option<String> {
 fn turn_completed(outcome: &TurnOutcome) -> bool {
     matches!(
         outcome,
-        TurnOutcome::Finished(_) | TurnOutcome::Handoff { .. }
+        TurnOutcome::Finished(_) | TurnOutcome::AgentFrameSwitch { .. }
     )
 }
 
 fn turn_status_label(outcome: &TurnOutcome) -> &'static str {
     match outcome {
-        TurnOutcome::Finished(_) | TurnOutcome::Handoff { .. } => "completed",
+        TurnOutcome::Finished(_) | TurnOutcome::AgentFrameSwitch { .. } => "completed",
         TurnOutcome::Stopped(TurnStop::Cancelled) => "interrupted",
         TurnOutcome::Stopped(_) => "failed",
     }
@@ -999,9 +999,9 @@ fn turn_status_label(outcome: &TurnOutcome) -> &'static str {
 fn done_reason_label(outcome: &TurnOutcome) -> &'static str {
     match outcome {
         TurnOutcome::Finished(TurnFinish::AssistantMessage { .. }) => "assistant_message",
-        TurnOutcome::Finished(TurnFinish::SubmittedValue { .. }) => "submitted_value",
+        TurnOutcome::Finished(TurnFinish::FinalValue { .. }) => "submitted_value",
         TurnOutcome::Finished(TurnFinish::ToolValue { .. }) => "tool_value",
-        TurnOutcome::Handoff { .. } => "handoff",
+        TurnOutcome::AgentFrameSwitch { .. } => "agent_frame_switch",
         TurnOutcome::Stopped(TurnStop::Cancelled) => "cancelled",
         TurnOutcome::Stopped(TurnStop::Incomplete) => "incomplete",
         TurnOutcome::Stopped(TurnStop::InvalidInput) => "invalid_input",
@@ -1225,24 +1225,28 @@ impl LongCoTEventSink {
 }
 
 #[async_trait::async_trait]
-impl EventSink for LongCoTEventSink {
-    async fn emit(&self, event: SessionEvent) {
-        if let SessionEvent::LlmRequest { mode_iteration, .. } = &event
-            && let Ok(mut turns) = self.iteration_count.lock()
-        {
-            turns.insert(*mode_iteration);
+impl TurnActivitySink for LongCoTEventSink {
+    async fn emit(&self, activity: TurnActivity) {
+        match &activity.event {
+            TurnEvent::ModelRequestStarted { protocol_iteration } => {
+                if let Ok(mut turns) = self.iteration_count.lock() {
+                    turns.insert(*protocol_iteration);
+                }
+            }
+            TurnEvent::AssistantProseDelta { text } => {
+                if let Ok(mut last) = self.last_llm_response.lock() {
+                    let response = last.get_or_insert_with(String::new);
+                    response.push_str(text);
+                }
+            }
+            TurnEvent::Error { message } => {
+                if let Ok(mut last) = self.last_error.lock() {
+                    *last = Some(message.clone());
+                }
+            }
+            _ => {}
         }
-        if let SessionEvent::LlmResponse { content, .. } = &event
-            && let Ok(mut last) = self.last_llm_response.lock()
-        {
-            *last = Some(content.trim().to_string());
-        }
-        if let SessionEvent::Error { message, .. } = &event
-            && let Ok(mut last) = self.last_error.lock()
-        {
-            *last = Some(message.clone());
-        }
-        if let Ok(line) = serde_json::to_string(&event)
+        if let Ok(line) = serde_json::to_string(&activity)
             && let Ok(mut file) = self.file.lock()
         {
             let _ = writeln!(file, "{line}");

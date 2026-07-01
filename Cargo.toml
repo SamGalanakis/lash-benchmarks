@@ -1,16 +1,18 @@
 [workspace]
 members = [
+    "bench/common",
     "bench/frontier-cs/runner",
     "bench/oolong/runner",
     "bench/longcot/runner",
     "bench/longmemeval-rlm/runner",
     "bench/swebench/runner",
+    "bench/warden-sentry/runner",
     "bench/continual-learning-bench/runner",
 ]
 resolver = "3"
 
 [workspace.package]
-version = "0.1.0-alpha.9"
+version = "0.1.0-alpha.78"
 license = "MIT"
 edition = "2024"
 publish = false
@@ -22,7 +24,30 @@ chrono = "0.4"
 clap = "4"
 regex = "1"
 reqwest = { version = "0.13", default-features = false }
+schemars = "0.8"
 serde = "1"
 serde_json = "1"
 tokio = "1"
 tokio-util = "0.7"
+
+# Lash, consumed from the latest GitHub release tag.
+lash = { package = "lash-runtime", git = "https://github.com/SamGalanakis/lash", tag = "v0.1.0-alpha.78", version = "=0.1.0-alpha.78", features = ["rlm"] }
+lash-core = { git = "https://github.com/SamGalanakis/lash", tag = "v0.1.0-alpha.78", version = "=0.1.0-alpha.78", default-features = false }
+lash-cli = { git = "https://github.com/SamGalanakis/lash", tag = "v0.1.0-alpha.78", version = "=0.1.0-alpha.78" }
+lash-export = { git = "https://github.com/SamGalanakis/lash", tag = "v0.1.0-alpha.78", version = "=0.1.0-alpha.78" }
+lash-harness-opt = { git = "https://github.com/SamGalanakis/lash", tag = "v0.1.0-alpha.78", version = "=0.1.0-alpha.78" }
+lash-llm-tools = { git = "https://github.com/SamGalanakis/lash", tag = "v0.1.0-alpha.78", version = "=0.1.0-alpha.78" }
+lash-plugin-observational-memory = { git = "https://github.com/SamGalanakis/lash", tag = "v0.1.0-alpha.78", version = "=0.1.0-alpha.78" }
+lash-plugin-process-controls = { git = "https://github.com/SamGalanakis/lash", tag = "v0.1.0-alpha.78", version = "=0.1.0-alpha.78" }
+lash-protocol-rlm = { git = "https://github.com/SamGalanakis/lash", tag = "v0.1.0-alpha.78", version = "=0.1.0-alpha.78" }
+lash-provider-anthropic = { git = "https://github.com/SamGalanakis/lash", tag = "v0.1.0-alpha.78", version = "=0.1.0-alpha.78" }
+lash-provider-google = { git = "https://github.com/SamGalanakis/lash", tag = "v0.1.0-alpha.78", version = "=0.1.0-alpha.78" }
+lash-provider-openai = { git = "https://github.com/SamGalanakis/lash", tag = "v0.1.0-alpha.78", version = "=0.1.0-alpha.78" }
+lash-rlm-types = { git = "https://github.com/SamGalanakis/lash", tag = "v0.1.0-alpha.78", version = "=0.1.0-alpha.78" }
+lash-sqlite-store = { git = "https://github.com/SamGalanakis/lash", tag = "v0.1.0-alpha.78", version = "=0.1.0-alpha.78" }
+lash-standard-plugins = { git = "https://github.com/SamGalanakis/lash", tag = "v0.1.0-alpha.78", version = "=0.1.0-alpha.78" }
+lash-subagents = { git = "https://github.com/SamGalanakis/lash", tag = "v0.1.0-alpha.78", version = "=0.1.0-alpha.78" }
+lashlang = { git = "https://github.com/SamGalanakis/lash", tag = "v0.1.0-alpha.78", version = "=0.1.0-alpha.78" }
+
+# Shared benchmark helpers (provider config loading from ~/.lash/config.json).
+bench-common = { path = "bench/common" }

@@ -5,9 +5,9 @@ from __future__ import annotations
 import os
 import shlex
 import json
+from dataclasses import dataclass
 from pathlib import Path
 
-from harbor.agents.installed.base import ExecInput
 from harbor.agents.installed.opencode import OpenCode
 from harbor.environments.base import BaseEnvironment
 from harbor.models.agent.context import AgentContext
@@ -40,6 +40,14 @@ if [ ! -x /usr/bin/time ]; then
   fi
 fi
 """
+
+
+@dataclass
+class ExecInput:
+    command: str
+    env: dict[str, str] | None = None
+    cwd: str | None = None
+    timeout_sec: int | None = None
 
 
 class BenchOpenCodeAgent(OpenCode):

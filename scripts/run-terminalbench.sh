@@ -11,6 +11,8 @@ if [[ -f "${PIN_FILE}" ]]; then
   source "${PIN_FILE}"
 fi
 LASH_GIT_URL="${LASH_GIT_URL:-https://github.com/SamGalanakis/lash}"
+LASH_GIT_TAG="${LASH_GIT_TAG:-}"
+LASH_GIT_BRANCH="${LASH_GIT_BRANCH:-}"
 LASH_GIT_REV="${LASH_GIT_REV:-}"
 
 usage() {
@@ -89,9 +91,31 @@ require_cmd() {
 }
 
 require_lash_pin() {
-  if [[ -z "${LASH_GIT_REV}" ]]; then
-    echo "error: LASH_GIT_REV is required; set it in ${PIN_FILE}" >&2
+  if [[ -z "${LASH_GIT_TAG}" && -z "${LASH_GIT_BRANCH}" && -z "${LASH_GIT_REV}" ]]; then
+    echo "error: one of LASH_GIT_REV, LASH_GIT_BRANCH, or LASH_GIT_TAG is required; set it in ${PIN_FILE}" >&2
     exit 1
+  fi
+}
+
+lash_ref_args() {
+  local -n out_ref_args="$1"
+  out_ref_args=()
+  if [[ -n "${LASH_GIT_REV}" ]]; then
+    out_ref_args=(--rev "${LASH_GIT_REV}")
+  elif [[ -n "${LASH_GIT_BRANCH}" ]]; then
+    out_ref_args=(--branch "${LASH_GIT_BRANCH}")
+  else
+    out_ref_args=(--tag "${LASH_GIT_TAG}")
+  fi
+}
+
+lash_ref_label() {
+  if [[ -n "${LASH_GIT_REV}" ]]; then
+    printf 'rev %s' "${LASH_GIT_REV}"
+  elif [[ -n "${LASH_GIT_BRANCH}" ]]; then
+    printf 'branch %s' "${LASH_GIT_BRANCH}"
+  else
+    printf 'tag %s' "${LASH_GIT_TAG}"
   fi
 }
 
@@ -461,12 +485,14 @@ fi
 
 build_host_binary() {
   require_lash_pin
-  echo "==> Installing pinned lash benchmark binary on host (${LASH_GIT_REV})" >&2
+  local ref_args=()
+  lash_ref_args ref_args
+  echo "==> Installing pinned lash benchmark binary on host ($(lash_ref_label))" >&2
   cargo install \
     --locked \
     --git "${LASH_GIT_URL}" \
-    --rev "${LASH_GIT_REV}" \
-    --package lash-cli \
+    "${ref_args[@]}" \
+    lash-cli \
     --bin lash \
     --root "${REPO_ROOT}/.lash-bin" \
     --force >/dev/null
@@ -479,18 +505,28 @@ build_docker_binary() {
   local install_dir="${REPO_ROOT}/${install_subdir}"
   require_lash_pin
   mkdir -p "${install_dir}"
-  echo "==> Installing pinned lash benchmark binary in ${image} (${LASH_GIT_REV})" >&2
+  echo "==> Installing pinned lash benchmark binary in ${image} ($(lash_ref_label))" >&2
   docker run --rm -u root \
-    -e LASH_GIT_URL \
-    -e LASH_GIT_REV \
+    -e "LASH_GIT_URL=${LASH_GIT_URL}" \
+    -e "LASH_GIT_TAG=${LASH_GIT_TAG}" \
+    -e "LASH_GIT_BRANCH=${LASH_GIT_BRANCH}" \
+    -e "LASH_GIT_REV=${LASH_GIT_REV}" \
     -v "${REPO_ROOT}:/work" \
     -w /work \
     "${image}" \
     bash -lc \
       '. /usr/local/cargo/env &&
+       ref_args=() &&
+       if [[ -n "${LASH_GIT_REV:-}" ]]; then
+         ref_args=(--rev "$LASH_GIT_REV");
+       elif [[ -n "${LASH_GIT_BRANCH:-}" ]]; then
+         ref_args=(--branch "$LASH_GIT_BRANCH");
+       else
+         ref_args=(--tag "$LASH_GIT_TAG");
+       fi &&
        apt-get update >/dev/null &&
        apt-get install -y protobuf-compiler zstd python3-dev >/dev/null &&
-       cargo install --locked --git "$LASH_GIT_URL" --rev "$LASH_GIT_REV" --package lash-cli --bin lash --root /work/'"${install_subdir}"' --force &&
+       cargo install --locked --git "$LASH_GIT_URL" "${ref_args[@]}" lash-cli --bin lash --root /work/'"${install_subdir}"' --force &&
        chown -R $(stat -c "%u:%g" /work) /work/'"${install_subdir}"'' >/dev/null
   BINARY_PATH="${install_dir}/bin/lash"
 }
@@ -699,11 +735,11 @@ if [[ "${DEBUG}" -eq 1 ]]; then
 fi
 
 for pattern in "${TASK_PATTERNS[@]}"; do
-  CMD+=(--task-name "${pattern}")
+  CMD+=(--include-task-name "${pattern}")
 done
 
 for task_name in "${EXACT_TASKS[@]}"; do
-  CMD+=(--task-name "${task_name}")
+  CMD+=(--include-task-name "${task_name}")
 done
 
 for pattern in "${EXCLUDE_PATTERNS[@]}"; do

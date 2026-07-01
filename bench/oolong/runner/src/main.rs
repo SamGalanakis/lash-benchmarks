@@ -12,11 +12,10 @@ use async_trait::async_trait;
 use chrono::Utc;
 use clap::{Parser, ValueEnum};
 use dataset::{OolongQuestion, OolongSuite, default_dataset_path, load_questions};
+use lash::rlm::RlmTurnBuilderExt;
 use lash::{
-    LashCore, ModeId, ModePreset, PluginStack, SessionSpec, TurnInput,
-    advanced::{
-        EventSink, ExecutionMode, ModeTurnOptions, TurnContext, TurnFinish, TurnOutcome, TurnStop,
-    },
+    ModelSpec, PluginStack, RlmCore, SessionSpec, TurnActivity, TurnActivitySink, TurnEvent,
+    TurnInput,
     prompt::{
         PromptBuiltin, PromptLayer, PromptSlot, PromptTemplate, PromptTemplateEntry,
         PromptTemplateSection,
@@ -25,14 +24,13 @@ use lash::{
     usage::{SessionUsageReport, TokenLedgerEntry, TokenUsage, diff_usage_reports},
 };
 use lash_cli::config::LashConfig;
-use lash_core::{InputItem, SessionEvent};
+use lash_core::{TestLocalProcessRegistry, TurnFinish, TurnOutcome, TurnStop};
 use lash_export::{ExportFormat, export};
 use lash_llm_tools::LlmToolsPluginFactory;
-use lash_mode_rlm::{RlmModePluginConfig, RlmPromptFeatures, RlmTurnInputExt};
-use lash_plugin_process_controls::ProcessControlsPluginFactory;
+use lash_plugin_process_controls::SessionProcessAdminPluginFactory;
+use lash_protocol_rlm::{RlmPromptFeatures, RlmProtocolPluginConfig, RlmTurnInputExt};
 use lash_provider_openai::OPENROUTER_BASE_URL;
-use lash_rlm_types::RlmTermination;
-use lash_sqlite_store::{SqliteProcessRegistry, Store};
+use lash_sqlite_store::Store;
 use lash_subagents::{CapabilityRegistry, StaticCapability, SubagentsPluginFactory};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -344,7 +342,6 @@ struct TimingSummary {
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let _ = dotenvy::dotenv();
-    lash_providers_builtin::register_all();
 
     let args = Args::parse();
     let suite: OolongSuite = args.suite.into();
@@ -680,32 +677,40 @@ async fn run_question(
     let store_path = question_dir.join("session.db");
     let trace_path = question_dir.join("session.trace.jsonl");
     let store = Arc::new(
-        Store::open(&store_path).with_context(|| format!("open {}", store_path.display()))?,
+        Store::open(&store_path)
+            .await
+            .with_context(|| format!("open {}", store_path.display()))?,
     );
-    let execution_mode = ExecutionMode::new(EXECUTION_MODE_LABEL);
-    let model_spec = lash::ModelSpec::from_token_limits(
+    let model_spec = ModelSpec::from_token_limits(
         args.model.clone(),
         Some(args.variant.clone()),
         args.max_context_tokens,
         None,
-        None,
     )
     .map_err(anyhow::Error::msg)?;
-    let core = LashCore::builder()
-        .install_mode(ModePreset::rlm_with_config(rlm_config(args)))
-        .default_mode(ModeId::rlm())
+    let core = RlmCore::builder()
+        .rlm_protocol_config(rlm_config(args))
         .provider(provider.clone())
         .model(model_spec)
         .max_turns(args.max_turns)
-        .prompt_template(oolong_prompt_template())
-        .trace_jsonl_path(Some(trace_path.clone()))
-        .process_registry(Arc::new(SqliteProcessRegistry::memory()?))
-        .plugins(build_plugin_stack(execution_mode.clone(), args))
+        .store_factory(Arc::new(
+            lash::persistence::InMemorySessionStoreFactory::new(),
+        ))
+        .process_registry(Arc::new(TestLocalProcessRegistry::default()))
+        .process_env_store(Arc::new(
+            lash::persistence::InMemoryProcessExecutionEnvStore::new(),
+        ))
+        .plugins(build_plugin_stack(args))
+        .effect_host(Arc::new(lash::durability::InlineEffectHost::default()))
+        .lashlang_artifact_store(Arc::new(
+            lash::persistence::InMemoryLashlangArtifactStore::new(),
+        ))
+        .attachment_store(Arc::new(lash::persistence::InMemoryAttachmentStore::new()))
+        .trace_jsonl_path(trace_path.clone())
         .build()?;
     let session = core
         .session("root")
-        .rlm()
-        .store(store.clone())
+        .store(store.clone() as Arc<dyn lash::persistence::RuntimePersistence>)
         .open()
         .await?;
 
@@ -713,34 +718,31 @@ async fn run_question(
     let started = std::time::Instant::now();
     let cancel = tokio_util::sync::CancellationToken::new();
     let sink = Arc::new(OolongEventSink::new(question_dir.join("events.jsonl"))?);
-    let sink_trait: Arc<dyn EventSink> = sink.clone();
-    let input = TurnInput {
-        items: vec![InputItem::Text {
-            text: OOLONG_USER_DIRECTIVE.to_string(),
-        }],
-        image_blobs: Default::default(),
-        mode_turn_options: Some(ModeTurnOptions::typed(
-            execution_mode,
-            RlmTermination::SubmitRequired {
-                schema: Some(oolong_answer_schema(&question)),
-            },
-        )?),
-        trace_turn_id: None,
-        mode_extension: None,
-        turn_context: TurnContext::default(),
-    }
-    .rlm_project(build_projected_bindings(&question)?)?;
+    let sink_trait: Arc<dyn TurnActivitySink> = sink.clone();
+    let mut input = TurnInput::text(OOLONG_USER_DIRECTIVE.to_string())
+        .rlm_project(build_projected_bindings(&question)?)?;
+    input.trace_turn_id = None;
     let turn_result = session
         .turn(input)
         .cancel(cancel)
-        .collect_session_events_with(sink_trait.as_ref())
+        .prompt_template(oolong_prompt_template())
+        .require_finish_schema(oolong_answer_schema(&question))?
+        .stream_to(sink_trait.as_ref())
         .await;
     let background_result = if args.await_background_work && turn_result.is_ok() {
         session.processes().await_all().await
     } else {
         Ok(())
     };
-    let cancelled = session.processes().cancel_all().await?;
+    let cancel_scope = lash_core::ScopedEffectController::shared(
+        Arc::new(lash_core::InlineRuntimeEffectController),
+        lash_core::ExecutionScope::runtime_operation(format!(
+            "oolong-cancel-{}",
+            question.question_id
+        )),
+    )
+    .map_err(anyhow::Error::msg)?;
+    let cancelled = session.processes().cancel_all(cancel_scope).await?;
     if !cancelled.is_empty() {
         eprintln!(
             "  cancelled {} process(es) after {}",
@@ -818,7 +820,9 @@ async fn run_question(
         &trace_path,
         ExportFormat::Html,
         Some(&html_trace_path),
-    ) {
+    )
+    .await
+    {
         eprintln!(
             "warn: failed to render HTML trace for {}: {err:#}",
             question.question_id
@@ -920,7 +924,7 @@ fn label_choices_from_question(question: &str) -> Vec<String> {
 }
 
 fn prediction_from_turn(outcome: &TurnOutcome, assistant_text: &str) -> Value {
-    if let TurnOutcome::Finished(TurnFinish::SubmittedValue { value }) = outcome {
+    if let TurnOutcome::Finished(TurnFinish::FinalValue { value }) = outcome {
         return value.clone();
     }
     parse_answerish_value(assistant_text)
@@ -1048,8 +1052,8 @@ fn extract_text(content: Option<&Value>) -> String {
     }
 }
 
-fn build_plugin_stack(execution_mode: ExecutionMode, args: &Args) -> PluginStack {
-    let child_spec = child_session_spec(args, execution_mode.clone());
+fn build_plugin_stack(args: &Args) -> PluginStack {
+    let child_spec = child_session_spec(args);
     let llm_tools = match (&args.child_model, &args.child_variant) {
         (Some(model), variant) => {
             LlmToolsPluginFactory::default().with_model(model.clone(), variant.clone())
@@ -1061,7 +1065,9 @@ fn build_plugin_stack(execution_mode: ExecutionMode, args: &Args) -> PluginStack
     };
     let mut stack = lash::plugins::runtime_plugin_stack();
     stack.push(Arc::new(llm_tools));
-    stack.push(Arc::new(ProcessControlsPluginFactory::list_only_for_rlm()));
+    stack.push(Arc::new(
+        SessionProcessAdminPluginFactory::without_cancel_process(),
+    ));
     stack.push(Arc::new(
         SubagentsPluginFactory::new(Arc::new(CapabilityRegistry::new().with(Arc::new(
             StaticCapability::new(SUBAGENT_CAPABILITY, child_spec),
@@ -1071,21 +1077,14 @@ fn build_plugin_stack(execution_mode: ExecutionMode, args: &Args) -> PluginStack
     stack
 }
 
-fn child_session_spec(args: &Args, execution_mode: ExecutionMode) -> SessionSpec {
-    let mut spec = SessionSpec::inherit()
-        .mode(execution_mode)
-        .prompt_layer(oolong_child_prompt_layer());
+fn child_session_spec(args: &Args) -> SessionSpec {
+    let mut spec = SessionSpec::inherit().prompt_layer(oolong_child_prompt_layer());
     if args.child_model.is_some() || args.child_variant.is_some() {
         let child_model = args.child_model.as_deref().unwrap_or(&args.model);
         let child_variant = args.child_variant.clone();
-        let child_spec = lash::ModelSpec::from_token_limits(
-            child_model,
-            child_variant,
-            args.max_context_tokens,
-            None,
-            None,
-        )
-        .expect("benchmark child context window is non-zero");
+        let child_spec =
+            ModelSpec::from_token_limits(child_model, child_variant, args.max_context_tokens, None)
+                .expect("benchmark child context window is non-zero");
         spec = spec.model(child_spec);
     }
     if let Some(max_turns) = args.child_max_turns {
@@ -1132,23 +1131,24 @@ fn oolong_child_prompt_layer() -> PromptLayer {
     ]))
 }
 
-fn rlm_config(args: &Args) -> RlmModePluginConfig {
-    let mut config = RlmModePluginConfig {
+fn rlm_config(args: &Args) -> RlmProtocolPluginConfig {
+    let mut config = RlmProtocolPluginConfig {
         prompt_features: RlmPromptFeatures {
             images: false,
             ..RlmPromptFeatures::default()
         },
-        ..RlmModePluginConfig::default()
+        ..RlmProtocolPluginConfig::default()
     };
     if args.disable_continue_as_fallback {
         config.continue_as_soft_warn_tokens = None;
-        config.continue_as_forced_fallback_tokens = None;
     } else {
         if let Some(value) = args.soft_continue_as_tokens {
             config.continue_as_soft_warn_tokens = Some(value);
         }
         if let Some(value) = args.forced_continue_as_tokens {
-            config.continue_as_forced_fallback_tokens = Some(value);
+            eprintln!(
+                "warn: --forced-continue-as-tokens={value} is ignored by lash v0.1.0-alpha.78"
+            );
         }
     }
     config
@@ -1205,8 +1205,8 @@ Avoid copying the whole context into prose or printing whole document lists. Use
 
 fn build_projected_bindings(
     question: &OolongQuestion,
-) -> anyhow::Result<lash_mode_rlm::RlmProjectedBindings> {
-    Ok(lash_mode_rlm::RlmProjectedBindings::new()
+) -> anyhow::Result<lash_protocol_rlm::RlmProjectedBindings> {
+    Ok(lash_protocol_rlm::RlmProjectedBindings::new()
         .bind_json(
             "benchmark",
             json!({
@@ -1302,7 +1302,7 @@ fn read_env_var(name: &str) -> Option<String> {
 fn turn_completed(outcome: &TurnOutcome) -> bool {
     matches!(
         outcome,
-        TurnOutcome::Finished(_) | TurnOutcome::Handoff { .. }
+        TurnOutcome::Finished(_) | TurnOutcome::AgentFrameSwitch { .. }
     )
 }
 
@@ -1327,7 +1327,7 @@ fn fatal_provider_failure_reason(done_reason: &str, failure_reason: Option<&str>
 
 fn turn_status_label(outcome: &TurnOutcome) -> &'static str {
     match outcome {
-        TurnOutcome::Finished(_) | TurnOutcome::Handoff { .. } => "completed",
+        TurnOutcome::Finished(_) | TurnOutcome::AgentFrameSwitch { .. } => "completed",
         TurnOutcome::Stopped(TurnStop::Cancelled) => "interrupted",
         TurnOutcome::Stopped(_) => "failed",
     }
@@ -1336,9 +1336,9 @@ fn turn_status_label(outcome: &TurnOutcome) -> &'static str {
 fn done_reason_label(outcome: &TurnOutcome) -> &'static str {
     match outcome {
         TurnOutcome::Finished(TurnFinish::AssistantMessage { .. }) => "assistant_message",
-        TurnOutcome::Finished(TurnFinish::SubmittedValue { .. }) => "submitted_value",
+        TurnOutcome::Finished(TurnFinish::FinalValue { .. }) => "submitted_value",
         TurnOutcome::Finished(TurnFinish::ToolValue { .. }) => "tool_value",
-        TurnOutcome::Handoff { .. } => "handoff",
+        TurnOutcome::AgentFrameSwitch { .. } => "agent_frame_switch",
         TurnOutcome::Stopped(TurnStop::Cancelled) => "cancelled",
         TurnOutcome::Stopped(TurnStop::Incomplete) => "incomplete",
         TurnOutcome::Stopped(TurnStop::InvalidInput) => "invalid_input",
@@ -1707,24 +1707,23 @@ impl OolongEventSink {
 }
 
 #[async_trait]
-impl EventSink for OolongEventSink {
-    async fn emit(&self, event: SessionEvent) {
-        match &event {
-            SessionEvent::LlmRequest { mode_iteration, .. } => {
+impl TurnActivitySink for OolongEventSink {
+    async fn emit(&self, activity: TurnActivity) {
+        match &activity.event {
+            TurnEvent::ModelRequestStarted { protocol_iteration } => {
                 if let Ok(mut turns) = self.iteration_count.lock() {
-                    turns.insert(*mode_iteration);
+                    turns.insert(*protocol_iteration);
                 }
                 if let Ok(mut calls) = self.root_llm_calls.lock() {
                     *calls += 1;
                 }
             }
-            SessionEvent::LlmResponse { .. } => {}
-            SessionEvent::TokenUsage { .. } => {
+            TurnEvent::Usage { .. } => {
                 if let Ok(mut count) = self.token_usage_events.lock() {
                     *count += 1;
                 }
             }
-            SessionEvent::ChildTokenUsage { .. } => {
+            TurnEvent::ChildUsage { .. } => {
                 if let Ok(mut count) = self.child_usage_events.lock() {
                     *count += 1;
                 }
@@ -1732,7 +1731,7 @@ impl EventSink for OolongEventSink {
                     *calls += 1;
                 }
             }
-            SessionEvent::ToolCall {
+            TurnEvent::ToolCallCompleted {
                 name, duration_ms, ..
             } => {
                 if let Ok(mut counts) = self.tool_calls_by_name.lock() {
@@ -1742,14 +1741,14 @@ impl EventSink for OolongEventSink {
                     *durations.entry(name.clone()).or_default() += *duration_ms;
                 }
             }
-            SessionEvent::Error { message, .. } => {
+            TurnEvent::Error { message } => {
                 if let Ok(mut last) = self.last_error.lock() {
                     *last = Some(message.clone());
                 }
             }
             _ => {}
         }
-        if let Ok(line) = serde_json::to_string(&event)
+        if let Ok(line) = serde_json::to_string(&activity)
             && let Ok(mut file) = self.file.lock()
         {
             let _ = writeln!(file, "{line}");

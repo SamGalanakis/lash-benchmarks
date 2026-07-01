@@ -7,6 +7,7 @@
   - `scripts/perfreport.py <report.json>` summarizes or diffs those reports.
 - [terminalbench2](./terminalbench2/README.md): Harbor + Terminal Bench 2 harness for Lash and peer agents.
 - [appworld](./appworld/README.md): AppWorld MCP harness for evaluating Lash on task-world API workflows.
+- [warden-sentry](./warden-sentry/README.md): Direct Lash harness for Warden's Sentry vulnerability corpus, scoped to the corpus files at their recorded Sentry SHAs.
 - [continual-learning-bench](./continual-learning-bench/README.md): Thin local wrapper for running Lash as a cached system inside `pgasawa/continual-learning-bench`.
 - [frontier-cs](./frontier-cs/README.md): Native Frontier-CS harness that generates Lash RLM solutions and scores them with Frontier-CS's official evaluator.
 - [longmemeval-rlm](./longmemeval-rlm/README.md): Native Rust LongMemEval harness that evaluates Lash as an RLM system over the full structured history, closer to `rawwerks/longmemeval-rlm`.

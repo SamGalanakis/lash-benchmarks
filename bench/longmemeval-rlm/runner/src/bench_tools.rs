@@ -1,13 +1,41 @@
 use std::sync::Arc;
 
 use lash::tools::{
-    ToolAvailabilityConfig, ToolCall, ToolContract, ToolDefinition, ToolExecutionMode,
-    ToolManifest, ToolProvider, ToolResult,
+    StaticToolExecute, StaticToolProvider, ToolCall, ToolDefinition, ToolProvider, ToolResult,
+    ToolScheduling,
 };
 use regex::RegexBuilder;
+use schemars::JsonSchema;
+use serde::Deserialize;
 use serde_json::json;
 
 use crate::dataset::{LongMemEvalQuestion, LongMemEvalTurn};
+
+#[derive(Debug, Default, Deserialize, JsonSchema)]
+struct ListSessionsArgs {}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct GetSessionArgs {
+    #[schemars(range(min = 1))]
+    session_number: u64,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct SearchSessionsArgs {
+    query: String,
+    #[schemars(range(min = 1))]
+    limit: Option<u64>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct GrepSessionsArgs {
+    pattern: String,
+    #[schemars(range(min = 1))]
+    limit: Option<u64>,
+}
 
 #[derive(Clone)]
 pub struct BenchmarkQuestionContext {
@@ -195,119 +223,71 @@ impl LongMemEvalSessionTools {
     pub fn new(ctx: BenchmarkQuestionContext) -> Self {
         Self { ctx }
     }
+
+    pub fn into_provider(ctx: BenchmarkQuestionContext) -> Arc<dyn ToolProvider> {
+        Arc::new(StaticToolProvider::new(
+            session_tool_definitions(),
+            Self::new(ctx),
+        ))
+    }
 }
 
-fn bench_tool(name: &str, description: &str, input_schema: serde_json::Value) -> ToolDefinition {
-    ToolDefinition::raw(
-        format!("tool:{name}"),
-        name,
-        description,
-        input_schema,
-        serde_json::json!({ "type": "object", "additionalProperties": true }),
-    )
-    .with_availability(ToolAvailabilityConfig::callable())
-    .with_execution_mode(ToolExecutionMode::Parallel)
+fn session_tool<Args: JsonSchema>(name: &str, description: &str) -> ToolDefinition {
+    ToolDefinition::typed::<Args, serde_json::Value>(format!("tool:{name}"), name, description)
+        .with_scheduling(ToolScheduling::Parallel)
+}
+
+fn session_tool_definitions() -> Vec<ToolDefinition> {
+    vec![
+        session_tool::<ListSessionsArgs>(
+            "list_sessions",
+            "List benchmark sessions in chronological order with dates and previews.",
+        ),
+        session_tool::<GetSessionArgs>(
+            "get_session",
+            "Fetch a full benchmark session by 1-based session number.",
+        ),
+        session_tool::<SearchSessionsArgs>(
+            "search_sessions",
+            "Search sessions by plain-text query and return the best-matching session previews.",
+        ),
+        session_tool::<GrepSessionsArgs>(
+            "grep_sessions",
+            "Search session contents with a regular expression and return matching snippets.",
+        ),
+    ]
 }
 
 #[async_trait::async_trait]
-impl ToolProvider for LongMemEvalSessionTools {
-    fn tool_manifests(&self) -> Vec<ToolManifest> {
-        self.tool_definitions()
-            .into_iter()
-            .map(|tool| tool.manifest())
-            .collect()
-    }
-
-    fn resolve_contract(&self, name: &str) -> Option<Arc<ToolContract>> {
-        self.tool_definitions()
-            .into_iter()
-            .find(|tool| tool.name == name)
-            .map(|tool| Arc::new(tool.contract()))
-    }
-
+impl StaticToolExecute for LongMemEvalSessionTools {
     async fn execute(&self, call: ToolCall<'_>) -> ToolResult {
-        let args = call.args;
         match call.name {
             "list_sessions" => ToolResult::ok(self.ctx.list_sessions()),
             "get_session" => {
-                let Some(number) = args.get("session_number").and_then(|value| value.as_u64())
-                else {
-                    return ToolResult::err_fmt("session_number must be an integer");
+                let args: GetSessionArgs = match serde_json::from_value(call.args.clone()) {
+                    Ok(args) => args,
+                    Err(err) => return ToolResult::err_fmt(format_args!("invalid args: {err}")),
                 };
-                self.ctx.get_session(number as usize)
+                self.ctx.get_session(args.session_number as usize)
             }
             "search_sessions" => {
-                let query = args
-                    .get("query")
-                    .and_then(|value| value.as_str())
-                    .unwrap_or("");
-                let limit = args
-                    .get("limit")
-                    .and_then(|value| value.as_u64())
-                    .unwrap_or(5);
-                self.ctx.search_sessions(query, limit as usize)
+                let args: SearchSessionsArgs = match serde_json::from_value(call.args.clone()) {
+                    Ok(args) => args,
+                    Err(err) => return ToolResult::err_fmt(format_args!("invalid args: {err}")),
+                };
+                self.ctx
+                    .search_sessions(&args.query, args.limit.unwrap_or(5) as usize)
             }
             "grep_sessions" => {
-                let pattern = args
-                    .get("pattern")
-                    .and_then(|value| value.as_str())
-                    .unwrap_or("");
-                let limit = args
-                    .get("limit")
-                    .and_then(|value| value.as_u64())
-                    .unwrap_or(20);
-                self.ctx.grep_sessions(pattern, limit as usize)
+                let args: GrepSessionsArgs = match serde_json::from_value(call.args.clone()) {
+                    Ok(args) => args,
+                    Err(err) => return ToolResult::err_fmt(format_args!("invalid args: {err}")),
+                };
+                self.ctx
+                    .grep_sessions(&args.pattern, args.limit.unwrap_or(20) as usize)
             }
             other => ToolResult::err_fmt(format_args!("Unknown session tool: {other}")),
         }
-    }
-}
-
-impl LongMemEvalSessionTools {
-    fn tool_definitions(&self) -> Vec<ToolDefinition> {
-        vec![
-            bench_tool(
-                "list_sessions",
-                "List benchmark sessions in chronological order with dates and previews.",
-                ToolDefinition::default_input_schema(),
-            ),
-            bench_tool(
-                "get_session",
-                "Fetch a full benchmark session by 1-based session number.",
-                serde_json::json!({
-                    "type": "object",
-                    "properties": { "session_number": { "type": "integer", "minimum": 1 } },
-                    "required": ["session_number"],
-                    "additionalProperties": false
-                }),
-            ),
-            bench_tool(
-                "search_sessions",
-                "Search sessions by plain-text query and return the best-matching session previews.",
-                serde_json::json!({
-                    "type": "object",
-                    "properties": {
-                        "query": { "type": "string" },
-                        "limit": { "type": "integer", "minimum": 1 }
-                    },
-                    "required": ["query"],
-                    "additionalProperties": false
-                }),
-            ),
-            bench_tool(
-                "grep_sessions",
-                "Search session contents with a regular expression and return matching snippets.",
-                serde_json::json!({
-                    "type": "object",
-                    "properties": {
-                        "pattern": { "type": "string" },
-                        "limit": { "type": "integer", "minimum": 1 }
-                    },
-                    "required": ["pattern"],
-                    "additionalProperties": false
-                }),
-            ),
-        ]
     }
 }
 

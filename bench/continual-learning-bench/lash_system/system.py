@@ -71,6 +71,10 @@ class LashSystem(ContinualLearningSystem):
         ).expanduser().resolve()
         self._single_session = single_session
         self._repair_attempts = max(0, int(repair_attempts))
+        if self._execution_mode != "rlm":
+            raise ValueError("Lash CLBench currently supports only execution_mode='rlm'")
+        if self._context_approach:
+            raise ValueError("context_approach is not supported for Lash CLBench RLM runs")
 
         state_root = Path(
             os.environ.get(
@@ -131,6 +135,7 @@ class LashSystem(ContinualLearningSystem):
             self._session_db.unlink()
         self._clear_dir(self._workspace)
         self._clear_dir(self._turns_dir)
+        self._clear_dir(self._tmp_dir / "lash-runtime")
         self._write_lash_config()
 
     def get_run_artifacts(self) -> dict[str, Any]:
@@ -176,7 +181,16 @@ class LashSystem(ContinualLearningSystem):
             if release_binary.exists():
                 cmd = [str(release_binary)]
             else:
-                cmd = ["cargo", "run", "--release", "-p", "bench-clbench-lash", "--"]
+                cmd = [
+                    "cargo",
+                    "run",
+                    "--release",
+                    "--manifest-path",
+                    str(self._repo_root / "Cargo.toml"),
+                    "-p",
+                    "bench-clbench-lash",
+                    "--",
+                ]
 
         cmd.extend(["--request", str(request_path)])
         return cmd
@@ -201,49 +215,65 @@ class LashSystem(ContinualLearningSystem):
         usage_path: Path,
     ) -> tuple[BaseModel, dict[str, Any]]:
         attempts: list[dict[str, Any]] = []
-        proc, elapsed = self._run_runner(
-            prompt,
-            feedback=feedback,
-            response_schema=response_schema,
-            usage_path=usage_path,
-            attempt=0,
-        )
-        usage_artifact = self._read_usage_artifact(usage_path)
-        self._record_usage_events(usage_artifact, attempt=0)
-        output_text = proc.stdout.strip()
-        attempts.append(
-            {
-                "attempt": 0,
-                "exit_code": proc.returncode,
-                "elapsed_seconds": elapsed,
-                "stdout_chars": len(proc.stdout),
-                "stderr_chars": len(proc.stderr),
-                "usage": usage_artifact,
-            }
-        )
-
-        if proc.returncode != 0:
-            detail = (proc.stderr or proc.stdout).strip()
-            raise RuntimeError(
-                f"LLM call failed: Lash exited with code {proc.returncode}: {detail[:1000]}"
+        current_prompt = prompt
+        last_error: Exception | None = None
+        for attempt in range(self._repair_attempts + 1):
+            proc, elapsed = self._run_runner(
+                current_prompt,
+                feedback=feedback,
+                response_schema=response_schema,
+                usage_path=usage_path,
+                attempt=attempt,
+            )
+            usage_artifact = self._read_usage_artifact(usage_path)
+            self._record_usage_events(usage_artifact, attempt=attempt)
+            output_text = proc.stdout.strip()
+            attempts.append(
+                {
+                    "attempt": attempt,
+                    "exit_code": proc.returncode,
+                    "elapsed_seconds": elapsed,
+                    "stdout_chars": len(proc.stdout),
+                    "stderr_chars": len(proc.stderr),
+                    "usage": usage_artifact,
+                }
             )
 
-        try:
-            runner_response = json.loads(output_text)
-        except Exception as exc:
-            raise RuntimeError(f"Lash runner returned non-JSON output: {output_text[:1000]}") from exc
+            if proc.returncode != 0:
+                detail = (proc.stderr or proc.stdout).strip()
+                raise RuntimeError(
+                    f"LLM call failed: Lash exited with code {proc.returncode}: {detail[:1000]}"
+                )
 
-        try:
-            action = response_schema.model_validate(runner_response["action"])
-        except Exception as exc:
-            raise RuntimeError(
-                "Lash submitted a value that passed through the runner but could not "
-                "be instantiated as the CLBench response model"
-            ) from exc
+            try:
+                runner_response = json.loads(output_text)
+            except Exception as exc:
+                raise RuntimeError(
+                    f"Lash runner returned non-JSON output: {output_text[:1000]}"
+                ) from exc
 
-        metadata = self._metadata(usage_path, attempts)
-        self._turn_history.append(metadata)
-        return action, metadata
+            try:
+                action = response_schema.model_validate(runner_response["action"])
+            except Exception as exc:
+                last_error = exc
+                if attempt >= self._repair_attempts:
+                    break
+                current_prompt = self._repair_prompt(
+                    prompt,
+                    json.dumps(runner_response.get("action"), indent=2, default=str),
+                    str(exc),
+                )
+                feedback = None
+                continue
+
+            metadata = self._metadata(usage_path, attempts)
+            self._turn_history.append(metadata)
+            return action, metadata
+
+        raise RuntimeError(
+            "Lash submitted a value that passed through the runner but could not "
+            "be instantiated as the CLBench response model"
+        ) from last_error
 
     def _run_runner(
         self,

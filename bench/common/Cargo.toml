@@ -1,0 +1,20 @@
+[package]
+name = "bench-common"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[lib]
+name = "bench_common"
+path = "src/lib.rs"
+
+[dependencies]
+lash-core = { workspace = true }
+lash-provider-anthropic = { workspace = true }
+lash-provider-google = { workspace = true }
+lash-provider-openai = { workspace = true }
+anyhow = { workspace = true }
+serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true }
+dirs = "6"

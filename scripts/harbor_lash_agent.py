@@ -6,9 +6,10 @@ import os
 import shlex
 import json
 import tomllib
+from dataclasses import dataclass
 from pathlib import Path
 
-from harbor.agents.installed.base import BaseInstalledAgent, ExecInput
+from harbor.agents.installed.base import BaseInstalledAgent
 from harbor.environments.base import BaseEnvironment
 from harbor.models.agent.context import AgentContext
 from harbor.models.trial.paths import EnvironmentPaths
@@ -121,6 +122,14 @@ fi
 """
 
 
+@dataclass
+class ExecInput:
+    command: str
+    env: dict[str, str] | None = None
+    cwd: str | None = None
+    timeout_sec: int | None = None
+
+
 class LashAgent(BaseInstalledAgent):
     @staticmethod
     def _default_binary_path() -> Path:
@@ -175,6 +184,13 @@ class LashAgent(BaseInstalledAgent):
     @property
     def _install_agent_template_path(self) -> Path:
         return REPO_ROOT / "bench" / "terminalbench2" / "install-lash.sh.j2"
+
+    async def install(self, environment: BaseEnvironment) -> None:
+        await self.exec_as_root(
+            environment,
+            command=self._install_agent_template_path.read_text(),
+            env={"DEBIAN_FRONTEND": "noninteractive"},
+        )
 
     async def setup(self, environment: BaseEnvironment) -> None:
         await environment.exec(
@@ -261,7 +277,6 @@ class LashAgent(BaseInstalledAgent):
             if value:
                 env[key] = value
 
-        provider_flag = "--provider " if os.environ.get("LASH_PROVIDER_SETUP") == "1" else ""
         model_flag = (
             f"--model {shlex.quote(self.model_name)} " if self.model_name else ""
         )
@@ -300,7 +315,7 @@ class LashAgent(BaseInstalledAgent):
             ExecInput(
                 command=(
                     f"chmod +x {shlex.quote(lash_binary)} && "
-                    f"{shlex.quote(lash_binary)} {provider_flag}{model_flag}{variant_flag}"
+                    f"{shlex.quote(lash_binary)} {model_flag}{variant_flag}"
                     f"{context_approach_flag}{execution_mode_flag}"
                     f"--print {prompt}"
                 ),

@@ -6,10 +6,11 @@ import json
 import os
 import shlex
 from collections import defaultdict
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from harbor.agents.installed.base import BaseInstalledAgent, ExecInput
+from harbor.agents.installed.base import BaseInstalledAgent
 from harbor.environments.base import BaseEnvironment
 from harbor.models.agent.context import AgentContext
 from harbor.utils.templating import render_prompt_template
@@ -56,6 +57,14 @@ if ! command -v node >/dev/null 2>&1; then
 fi
 npm install -g @openai/codex 2>&1
 """
+
+
+@dataclass
+class ExecInput:
+    command: str
+    env: dict[str, str] | None = None
+    cwd: str | None = None
+    timeout_sec: int | None = None
 
 
 def load_codex_metadata(codex_path: Path | None) -> dict[str, Any]:
@@ -162,6 +171,9 @@ class BenchCodexAgent(BaseInstalledAgent):
     def _install_agent_template_path(self) -> Path:
         # Not used — setup() is fully overridden and never calls super().
         return Path("/dev/null")
+
+    async def install(self, environment: BaseEnvironment) -> None:
+        _ = environment
 
     @staticmethod
     def _command_metadata(command: str) -> dict[str, str]:
