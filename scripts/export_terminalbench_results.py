@@ -19,9 +19,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--preset")
     parser.add_argument("--requested-model")
     parser.add_argument("--variant")
+    parser.add_argument("--agent-version")
     parser.add_argument("--context-approach")
     parser.add_argument("--harbor-env", required=True)
-    parser.add_argument("--registry-url", required=True)
+    parser.add_argument("--registry-url", default="")
     parser.add_argument("--n-concurrent", type=int, required=True)
     parser.add_argument("--attempts", type=int, required=True)
     parser.add_argument("--timeout-multiplier", type=float, required=True)
@@ -48,6 +49,7 @@ def main() -> int:
             preset=ns.preset,
             requested_model=ns.requested_model,
             variant=ns.variant,
+            agent_version=ns.agent_version,
             context_approach=ns.context_approach,
             harbor_env=ns.harbor_env,
             registry_url=ns.registry_url,

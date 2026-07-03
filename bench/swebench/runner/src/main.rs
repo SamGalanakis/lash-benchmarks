@@ -14,8 +14,8 @@ use chrono::Utc;
 use clap::Parser;
 use dataset::{SweBenchInstance, load_instances};
 use lash::{
-    LashSession, ModelSpec, PluginStack, RlmCore, SessionSpec, StandardCore, TurnActivity,
-    TurnActivitySink, TurnEvent, TurnInput,
+    LashCore, LashSession, ModelSpec, PluginStack, SessionSpec, TurnActivity, TurnActivitySink,
+    TurnEvent, TurnInput,
     persistence::RuntimePersistence,
     provider::ProviderHandle,
     usage::{SessionUsageReport, diff_usage_reports},
@@ -635,7 +635,7 @@ async fn run_instance(
     .map_err(anyhow::Error::msg)?;
     let session: LashSession = match execution_mode {
         ExecutionMode::Standard => {
-            let core = StandardCore::builder()
+            let core = LashCore::standard_builder()
                 .provider(provider.clone())
                 .model(model_spec)
                 .max_turns(args.max_turns)
@@ -659,25 +659,25 @@ async fn run_instance(
                 .await?
         }
         ExecutionMode::Rlm => {
-            let core = RlmCore::builder()
-                .provider(provider.clone())
-                .model(model_spec)
-                .max_turns(args.max_turns)
-                .trace_jsonl_path(trace_path.clone())
-                .store_factory(Arc::new(
-                    lash::persistence::InMemorySessionStoreFactory::new(),
-                ))
-                .process_registry(Arc::new(TestLocalProcessRegistry::default()))
-                .process_env_store(Arc::new(
-                    lash::persistence::InMemoryProcessExecutionEnvStore::new(),
-                ))
-                .effect_host(Arc::new(lash::durability::InlineEffectHost::default()))
-                .lashlang_artifact_store(Arc::new(
-                    lash::persistence::InMemoryLashlangArtifactStore::new(),
-                ))
-                .attachment_store(Arc::new(lash::persistence::InMemoryAttachmentStore::new()))
-                .plugins(build_rlm_plugin_stack())
-                .build()?;
+            let core = LashCore::rlm_builder(lash::rlm::RlmProtocolPluginFactory::new(
+                lash::rlm::RlmProtocolPluginConfig::default(),
+                Arc::new(lash::persistence::InMemoryLashlangArtifactStore::new()),
+            ))
+            .provider(provider.clone())
+            .model(model_spec)
+            .max_turns(args.max_turns)
+            .trace_jsonl_path(trace_path.clone())
+            .store_factory(Arc::new(
+                lash::persistence::InMemorySessionStoreFactory::new(),
+            ))
+            .process_registry(Arc::new(TestLocalProcessRegistry::default()))
+            .process_env_store(Arc::new(
+                lash::persistence::InMemoryProcessExecutionEnvStore::new(),
+            ))
+            .effect_host(Arc::new(lash::durability::InlineEffectHost::default()))
+            .attachment_store(Arc::new(lash::persistence::InMemoryAttachmentStore::new()))
+            .plugins(build_rlm_plugin_stack())
+            .build()?;
             core.session("root")
                 .store(store.clone() as Arc<dyn RuntimePersistence>)
                 .open()
@@ -1058,8 +1058,8 @@ fn aggregate_usage(report: &SessionUsageReport) -> TokenTotals {
     for row in &report.by_source_model {
         out.input += row.usage.input_tokens.max(0) as u64;
         out.output += row.usage.output_tokens.max(0) as u64;
-        out.cache += row.usage.cached_input_tokens.max(0) as u64;
-        out.reasoning += row.usage.reasoning_tokens.max(0) as u64;
+        out.cache += row.usage.cache_read_input_tokens.max(0) as u64;
+        out.reasoning += row.usage.reasoning_output_tokens.max(0) as u64;
     }
     out
 }

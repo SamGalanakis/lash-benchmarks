@@ -13,13 +13,20 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-SCHEMA_VERSION = 10
+SCHEMA_VERSION = 11
 
 PRESET_TASKS: dict[str, tuple[str, ...]] = {
     "trivial": ("log-summary-date-ranges",),
     "smoke": (
         "log-summary-date-ranges",
         "fix-code-vulnerability",
+    ),
+    "smoke-5": (
+        "log-summary-date-ranges",
+        "regex-log",
+        "build-cython-ext",
+        "git-leak-recovery",
+        "nginx-request-logging",
     ),
     "fast-3": (
         "log-summary-date-ranges",
@@ -31,6 +38,16 @@ PRESET_TASKS: dict[str, tuple[str, ...]] = {
         "log-summary-date-ranges",
         "fix-code-vulnerability",
         "sqlite-with-gcov",
+    ),
+    "memory-3": (
+        "password-recovery",
+        "db-wal-recovery",
+        "git-leak-recovery",
+    ),
+    "recall-3": (
+        "password-recovery",
+        "git-leak-recovery",
+        "sanitize-git-repo",
     ),
     "representative-10": (
         "build-cython-ext",
@@ -44,7 +61,71 @@ PRESET_TASKS: dict[str, tuple[str, ...]] = {
         "regex-log",
         "sqlite-with-gcov",
     ),
+    "representative-20": (
+        "build-cython-ext",
+        "compile-compcert",
+        "configure-git-webserver",
+        "db-wal-recovery",
+        "fix-code-vulnerability",
+        "git-leak-recovery",
+        "log-summary-date-ranges",
+        "make-doom-for-mips",
+        "mteb-leaderboard",
+        "nginx-request-logging",
+        "password-recovery",
+        "polyglot-c-py",
+        "pytorch-model-recovery",
+        "query-optimize",
+        "raman-fitting",
+        "regex-log",
+        "sanitize-git-repo",
+        "sparql-university",
+        "sqlite-with-gcov",
+        "torch-tensor-parallelism",
+    ),
 }
+
+LOG_SINK_TEXT_SUFFIXES = {
+    ".json",
+    ".jsonl",
+    ".log",
+    ".md",
+    ".out",
+    ".err",
+    ".txt",
+    ".toml",
+    ".yaml",
+    ".yml",
+}
+TERMINALBENCH_TASK_PREFIX = "terminal-bench/"
+REDACTED_SECRET = "[REDACTED]"
+SENSITIVE_KEY_NAMES = {
+    "access_token",
+    "anthropic_api_key",
+    "api_key",
+    "authorization",
+    "client_secret",
+    "id_token",
+    "openai_api_key",
+    "password",
+    "private_key",
+    "refresh_token",
+    "secret",
+    "secret_key",
+    "tavily_api_key",
+    "token",
+}
+SECRET_TEXT_PATTERNS = (
+    (re.compile(r"sk-ant-api03-[A-Za-z0-9_-]{20,}"), "sk-ant-api03-[REDACTED]"),
+    (re.compile(r"sk-[A-Za-z0-9][A-Za-z0-9_-]{20,}"), "sk-[REDACTED]"),
+    (re.compile(r"rt\.[A-Za-z0-9][A-Za-z0-9._-]{20,}"), "rt.[REDACTED]"),
+    (
+        re.compile(
+            r"eyJ[A-Za-z0-9_-]{20,}\.[A-Za-z0-9_-]{20,}\.[A-Za-z0-9_-]{20,}"
+        ),
+        "jwt.[REDACTED]",
+    ),
+)
 
 
 def parse_ts(value: str | None) -> datetime | None:
@@ -85,12 +166,45 @@ def slugify(value: str) -> str:
     return slug or "run"
 
 
+def display_task_name(value: str) -> str:
+    return value.strip().removeprefix(TERMINALBENCH_TASK_PREFIX)
+
+
 def load_json(path: Path) -> dict[str, Any]:
     return json.loads(path.read_text()) if path.exists() else {}
 
 
 def read_text(path: Path) -> str:
     return path.read_text(errors="replace") if path.exists() else ""
+
+
+def is_sensitive_key(key: Any) -> bool:
+    if not isinstance(key, str):
+        return False
+    normalized = key.strip().lower()
+    return normalized in SENSITIVE_KEY_NAMES or normalized.endswith("_api_key") or normalized.endswith("_token")
+
+
+def redact_text(value: str) -> str:
+    redacted = value
+    for pattern, replacement in SECRET_TEXT_PATTERNS:
+        redacted = pattern.sub(replacement, redacted)
+    return redacted
+
+
+def redact_json_value(value: Any, *, parent_key: str | None = None) -> Any:
+    if parent_key and is_sensitive_key(parent_key):
+        return value if isinstance(value, (int, float, bool)) or value is None else REDACTED_SECRET
+    if isinstance(value, dict):
+        return {
+            key: redact_json_value(item, parent_key=key if isinstance(key, str) else None)
+            for key, item in value.items()
+        }
+    if isinstance(value, list):
+        return [redact_json_value(item, parent_key=parent_key) for item in value]
+    if isinstance(value, str):
+        return redact_text(value)
+    return value
 
 
 def nested_str(value: Any, path: tuple[str, ...]) -> str | None:
@@ -127,7 +241,7 @@ def normalize_task_names(values: Any) -> list[str]:
     for value in values:
         if not isinstance(value, str):
             continue
-        stripped = value.strip()
+        stripped = display_task_name(value)
         if not stripped or stripped in seen:
             continue
         seen.add(stripped)
@@ -167,7 +281,7 @@ def build_task_scope(
     requested = normalize_task_names(exact_tasks)
     executed = sorted(
         {
-            task_name.strip()
+            display_task_name(task_name)
             for trial in trials
             for task_name in [trial.get("task_name")]
             if isinstance(task_name, str) and task_name.strip()
@@ -295,6 +409,41 @@ def copy_artifact(src: Path, dst: Path) -> bool:
     if not src.exists():
         return False
     dst.parent.mkdir(parents=True, exist_ok=True)
+    suffix = src.suffix.lower()
+    if suffix == ".json":
+        try:
+            data = json.loads(src.read_text(errors="replace"))
+            dst.write_text(json.dumps(redact_json_value(data), indent=2) + "\n")
+            shutil.copystat(src, dst, follow_symlinks=True)
+            return True
+        except (OSError, json.JSONDecodeError):
+            pass
+    elif suffix == ".jsonl":
+        try:
+            with src.open(errors="replace") as in_handle, dst.open("w") as out_handle:
+                for line in in_handle:
+                    stripped = line.strip()
+                    if not stripped:
+                        out_handle.write(line)
+                        continue
+                    try:
+                        record = json.loads(stripped)
+                    except json.JSONDecodeError:
+                        out_handle.write(redact_text(line))
+                        continue
+                    out_handle.write(json.dumps(redact_json_value(record), sort_keys=True) + "\n")
+            shutil.copystat(src, dst, follow_symlinks=True)
+            return True
+        except OSError:
+            pass
+    elif suffix in LOG_SINK_TEXT_SUFFIXES:
+        try:
+            dst.write_text(redact_text(src.read_text(errors="replace")))
+            shutil.copystat(src, dst, follow_symlinks=True)
+            return True
+        except OSError:
+            pass
+
     shutil.copy2(src, dst)
     return True
 
@@ -401,8 +550,8 @@ def load_llm_metadata(llm_paths: list[Path]) -> dict[str, Any]:
             if isinstance(usage, dict):
                 token_totals["raw_input"] += int(usage.get("input_tokens") or 0)
                 token_totals["output"] += int(usage.get("output_tokens") or 0)
-                token_totals["cache"] += int(usage.get("cached_input_tokens") or 0)
-                token_totals["reasoning"] += int(usage.get("reasoning_tokens") or 0)
+                token_totals["cache"] += int(usage.get("cache_read_input_tokens") or 0)
+                token_totals["reasoning"] += int(usage.get("reasoning_output_tokens") or 0)
                 usage_record_count += 1
             context = record.get("context") if isinstance(record.get("context"), dict) else {}
             turn = context.get("iteration")
@@ -715,8 +864,8 @@ def _load_codex_metadata(codex_path: Path | None) -> dict[str, Any]:
             usage = record.get("usage") or {}
             tokens["input"] += int(usage.get("input_tokens") or 0)
             tokens["output"] += int(usage.get("output_tokens") or 0)
-            tokens["reasoning"] += int(usage.get("reasoning_tokens") or 0)
-            cached = int(usage.get("cached_input_tokens") or 0)
+            tokens["reasoning"] += int(usage.get("reasoning_output_tokens") or 0)
+            cached = int(usage.get("cache_read_input_tokens") or 0)
             tokens["cache"] += cached
             tokens["cache_read"] += cached
             total = tokens["input"] + tokens["output"]
@@ -1011,6 +1160,118 @@ def copy_directory_artifacts(src_dir: Path, dst_dir: Path, run_dir: Path) -> lis
     return copied
 
 
+def append_jsonl(path: Path, records: list[dict[str, Any]]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w") as handle:
+        for record in records:
+            handle.write(json.dumps(record, sort_keys=True) + "\n")
+
+
+def iter_log_sink_file_records(
+    *,
+    path: Path,
+    relative_path: str,
+    trial_name: str,
+    task_name: str,
+) -> list[dict[str, Any]]:
+    suffix = path.suffix.lower()
+    if suffix not in LOG_SINK_TEXT_SUFFIXES or not path.exists():
+        return []
+
+    base = {
+        "schema_version": 1,
+        "trial_name": trial_name,
+        "task_name": task_name,
+        "source": relative_path,
+    }
+
+    if suffix == ".json":
+        try:
+            return [
+                {
+                    **base,
+                    "kind": "json_document",
+                    "record": redact_json_value(json.loads(path.read_text(errors="replace"))),
+                }
+            ]
+        except json.JSONDecodeError:
+            pass
+
+    records: list[dict[str, Any]] = []
+    for line_no, line in enumerate(path.read_text(errors="replace").splitlines(), start=1):
+        if suffix == ".jsonl":
+            stripped = line.strip()
+            if not stripped:
+                continue
+            try:
+                records.append(
+                    {
+                        **base,
+                        "kind": "jsonl_record",
+                        "line_no": line_no,
+                        "record": redact_json_value(json.loads(stripped)),
+                    }
+                )
+                continue
+            except json.JSONDecodeError:
+                pass
+        records.append(
+            {
+                **base,
+                "kind": "log_line",
+                "line_no": line_no,
+                "text": redact_text(line),
+            }
+        )
+    return records
+
+
+def write_trial_log_sink(
+    *,
+    run_dir: Path,
+    artifacts_dir: Path,
+    trial_name: str,
+    task_name: str,
+    copied_artifacts: dict[str, str],
+    command_records: list[dict[str, Any]],
+    setup_record: dict[str, str],
+    session_artifacts: list[dict[str, Any]],
+) -> str:
+    relative_paths: list[str] = []
+    seen: set[str] = set()
+
+    def add_path(value: Any) -> None:
+        if not isinstance(value, str) or not value or value in seen:
+            return
+        seen.add(value)
+        relative_paths.append(value)
+
+    for value in copied_artifacts.values():
+        add_path(value)
+    for record in command_records:
+        for key in ("command", "stdout", "stderr", "return_code", "metadata_path", "resource_usage_path"):
+            add_path(record.get(key))
+    for value in setup_record.values():
+        add_path(value)
+    for item in session_artifacts:
+        add_path(item.get("path"))
+
+    sink_records: list[dict[str, Any]] = []
+    for relative_path in relative_paths:
+        sink_records.extend(
+            iter_log_sink_file_records(
+                path=run_dir / relative_path,
+                relative_path=relative_path,
+                trial_name=trial_name,
+                task_name=task_name,
+            )
+        )
+
+    sink_path = artifacts_dir / "log_sink.jsonl"
+    append_jsonl(sink_path, sink_records)
+    return safe_relative(sink_path, run_dir)
+
+
 def infer_command_metadata(
     command_dir: Path,
     command_text: str,
@@ -1123,6 +1384,7 @@ class ExportArgs:
     preset: str | None
     requested_model: str | None
     variant: str | None
+    agent_version: str | None
     context_approach: str | None
     harbor_env: str
     registry_url: str
@@ -1212,7 +1474,6 @@ def build_trial_record(
         "opencode_raw": agent_dir / "opencode.txt",
         "codex_raw": agent_dir / "codex.txt",
         "lash_log": lash_home_dir / "lash.log",
-        "lash_config": lash_home_dir / "config.json",
         "models_cache": lash_home_dir / "cache" / "models.json",
     }
     for key, src in copied_files.items():
@@ -1449,9 +1710,25 @@ def build_trial_record(
         reward=reward if isinstance(reward, (float, int)) else None,
     )
 
+    trial_name = result.get("trial_name", trial_dir.name)
+    raw_task_name = result.get("task_name")
+    if not isinstance(raw_task_name, str) or not raw_task_name.strip():
+        raw_task_name = trial_dir.name
+    task_name = display_task_name(raw_task_name)
+    copied_artifacts["log_sink_jsonl"] = write_trial_log_sink(
+        run_dir=run_dir,
+        artifacts_dir=artifacts_dir,
+        trial_name=trial_name,
+        task_name=task_name,
+        copied_artifacts=copied_artifacts,
+        command_records=command_records,
+        setup_record=setup_record,
+        session_artifacts=session_artifacts,
+    )
+
     return {
-        "trial_name": result.get("trial_name", trial_dir.name),
-        "task_name": result.get("task_name", trial_dir.name),
+        "trial_name": trial_name,
+        "task_name": task_name,
         "task_source": result.get("source"),
         "status": status,
         "reward": float(reward) if isinstance(reward, (float, int)) else None,
@@ -1466,6 +1743,7 @@ def build_trial_record(
             "preset": preset,
             "preset_source": preset_source,
             "requested_model": args.requested_model,
+            "agent_version": args.agent_version or None,
             "resolved_models": resolved_models,
             "variant": args.variant or None,
             "context_approach": args.context_approach or None,
@@ -1617,6 +1895,33 @@ def build_task_rollups(trials: list[dict[str, Any]]) -> list[dict[str, Any]]:
     return rollups
 
 
+def write_run_jsonl_artifacts(run_dir: Path, trials: list[dict[str, Any]]) -> dict[str, str]:
+    trials_path = run_dir / "trials.jsonl"
+    task_logs_path = run_dir / "task_logs.jsonl"
+
+    with trials_path.open("w") as handle:
+        for trial in trials:
+            handle.write(json.dumps(trial, sort_keys=True) + "\n")
+
+    with task_logs_path.open("w") as out_handle:
+        for trial in trials:
+            files = (trial.get("artifacts") or {}).get("files") or {}
+            sink_rel = files.get("log_sink_jsonl")
+            if not isinstance(sink_rel, str):
+                continue
+            sink_path = run_dir / sink_rel
+            if not sink_path.exists():
+                continue
+            for line in sink_path.read_text(errors="replace").splitlines():
+                if line.strip():
+                    out_handle.write(line + "\n")
+
+    return {
+        "trials_jsonl": safe_relative(trials_path, run_dir),
+        "task_logs_jsonl": safe_relative(task_logs_path, run_dir),
+    }
+
+
 def export_run(args: ExportArgs) -> Path:
     preset, preset_source = resolve_preset(args.preset, args.exact_tasks)
     job_result = load_json(args.job_dir / "result.json")
@@ -1627,7 +1932,12 @@ def export_run(args: ExportArgs) -> Path:
     run_dir.mkdir(parents=True, exist_ok=True)
 
     job_artifacts_dir = run_dir / "job-artifacts"
-    for src in (args.job_dir / "config.json", args.job_dir / "result.json", args.job_dir / "job.log"):
+    for src in (
+        args.job_dir / "config.json",
+        args.job_dir / "result.json",
+        args.job_dir / "job.log",
+        args.job_dir / "reused-trials.json",
+    ):
         if src.exists():
             copy_artifact(src, job_artifacts_dir / src.name)
 
@@ -1636,6 +1946,7 @@ def export_run(args: ExportArgs) -> Path:
         trials.append(build_trial_record(trial_result.parent, run_dir, args))
 
     task_scope = build_task_scope(args.exact_tasks, args.task_patterns, trials)
+    run_artifacts = write_run_jsonl_artifacts(run_dir, trials)
 
     run_payload = {
         "schema_version": SCHEMA_VERSION,
@@ -1650,6 +1961,7 @@ def export_run(args: ExportArgs) -> Path:
             "preset": preset,
             "preset_source": preset_source,
             "requested_model": args.requested_model,
+            "agent_version": args.agent_version or None,
             "variant": args.variant or None,
             "context_approach": args.context_approach or None,
             "provider": load_provider_metadata(args.provider_config),
@@ -1678,6 +1990,7 @@ def export_run(args: ExportArgs) -> Path:
         "global_stats": build_global_stats(trials),
         "task_rollups": build_task_rollups(trials),
         "trials": trials,
+        "artifacts": run_artifacts,
     }
 
     (run_dir / "run.json").write_text(json.dumps(run_payload, indent=2) + "\n")

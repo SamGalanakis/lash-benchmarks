@@ -14,8 +14,8 @@ use chrono::Utc;
 use clap::{ArgAction, Parser, ValueEnum};
 use dataset::{LongMemEvalQuestion, load_questions};
 use lash::{
-    ModelSpec, PluginStack, RlmCore, SessionSpec, StandardCore, TurnActivity, TurnActivitySink,
-    TurnEvent, TurnInput,
+    LashCore, ModelSpec, PluginStack, SessionSpec, TurnActivity, TurnActivitySink, TurnEvent,
+    TurnInput,
     persistence::RuntimePersistence,
     plugins::{PluginSpec, StaticPluginFactory},
     prompt::{PromptSlot, PromptTemplate, PromptTemplateEntry, PromptTemplateSection},
@@ -622,7 +622,7 @@ async fn run_question(
     );
     let session = match execution_mode {
         ExecutionMode::Standard => {
-            let core = StandardCore::builder()
+            let core = LashCore::standard_builder()
                 .provider(provider.clone())
                 .model(model_spec)
                 .trace_jsonl_path(trace_path.clone())
@@ -643,24 +643,24 @@ async fn run_question(
                 .await?
         }
         ExecutionMode::Rlm => {
-            let core = RlmCore::builder()
-                .provider(provider.clone())
-                .model(model_spec)
-                .trace_jsonl_path(trace_path.clone())
-                .store_factory(Arc::new(
-                    lash::persistence::InMemorySessionStoreFactory::new(),
-                ))
-                .process_registry(Arc::new(TestLocalProcessRegistry::default()))
-                .process_env_store(Arc::new(
-                    lash::persistence::InMemoryProcessExecutionEnvStore::new(),
-                ))
-                .effect_host(Arc::new(lash::durability::InlineEffectHost::default()))
-                .lashlang_artifact_store(Arc::new(
-                    lash::persistence::InMemoryLashlangArtifactStore::new(),
-                ))
-                .attachment_store(Arc::new(lash::persistence::InMemoryAttachmentStore::new()))
-                .plugins(plugin_stack)
-                .build()?;
+            let core = LashCore::rlm_builder(lash::rlm::RlmProtocolPluginFactory::new(
+                lash::rlm::RlmProtocolPluginConfig::default(),
+                Arc::new(lash::persistence::InMemoryLashlangArtifactStore::new()),
+            ))
+            .provider(provider.clone())
+            .model(model_spec)
+            .trace_jsonl_path(trace_path.clone())
+            .store_factory(Arc::new(
+                lash::persistence::InMemorySessionStoreFactory::new(),
+            ))
+            .process_registry(Arc::new(TestLocalProcessRegistry::default()))
+            .process_env_store(Arc::new(
+                lash::persistence::InMemoryProcessExecutionEnvStore::new(),
+            ))
+            .effect_host(Arc::new(lash::durability::InlineEffectHost::default()))
+            .attachment_store(Arc::new(lash::persistence::InMemoryAttachmentStore::new()))
+            .plugins(plugin_stack)
+            .build()?;
             core.session("root")
                 .store(store.clone() as Arc<dyn RuntimePersistence>)
                 .open()
@@ -1074,8 +1074,8 @@ fn aggregate_usage(reports: impl IntoIterator<Item = SessionUsageReport>) -> Ses
             let entry = total.entry(key).or_default();
             entry.input_tokens += row.usage.input_tokens;
             entry.output_tokens += row.usage.output_tokens;
-            entry.cached_input_tokens += row.usage.cached_input_tokens;
-            entry.reasoning_tokens += row.usage.reasoning_tokens;
+            entry.cache_read_input_tokens += row.usage.cache_read_input_tokens;
+            entry.reasoning_output_tokens += row.usage.reasoning_output_tokens;
         }
     }
     let entries = total
@@ -1155,9 +1155,9 @@ fn format_usage_line(label: &str, usage: &UsageTotals) -> String {
     format!(
         "{label}: input={} cached={} output={} reasoning={} total={} context_total={}",
         usage.input_tokens,
-        usage.cached_input_tokens,
+        usage.cache_read_input_tokens,
         usage.output_tokens,
-        usage.reasoning_tokens,
+        usage.reasoning_output_tokens,
         usage.total_tokens,
         usage.context_total_tokens
     )
@@ -1436,8 +1436,8 @@ fn context_tokens_for_usage(usage: &TokenUsage) -> i64 {
         .input_tokens
         .max(0)
         .saturating_add(usage.output_tokens.max(0))
-        .saturating_add(usage.reasoning_tokens.max(0))
-        .saturating_add(usage.cached_input_tokens.max(0))
+        .saturating_add(usage.reasoning_output_tokens.max(0))
+        .saturating_add(usage.cache_read_input_tokens.max(0))
 }
 
 fn non_empty_text(text: &str) -> Option<String> {
@@ -1491,8 +1491,9 @@ mod tests {
         assert!(!budget.record(&TokenUsage {
             input_tokens: 40,
             output_tokens: 5,
-            cached_input_tokens: 10,
-            reasoning_tokens: 0,
+            cache_read_input_tokens: 10,
+            cache_write_input_tokens: 0,
+            reasoning_output_tokens: 0,
         }));
         assert_eq!(budget.observed_context_tokens, 55);
         assert!(!budget.exceeded);
@@ -1504,14 +1505,16 @@ mod tests {
         assert!(!budget.record(&TokenUsage {
             input_tokens: 45,
             output_tokens: 5,
-            cached_input_tokens: 0,
-            reasoning_tokens: 0,
+            cache_read_input_tokens: 0,
+            cache_write_input_tokens: 0,
+            reasoning_output_tokens: 0,
         }));
         assert!(budget.record(&TokenUsage {
             input_tokens: 40,
             output_tokens: 0,
-            cached_input_tokens: 20,
-            reasoning_tokens: 0,
+            cache_read_input_tokens: 20,
+            cache_write_input_tokens: 0,
+            reasoning_output_tokens: 0,
         }));
         assert_eq!(budget.observed_context_tokens, 110);
         assert!(budget.exceeded);

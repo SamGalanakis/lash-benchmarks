@@ -5,15 +5,16 @@ https://warden.sentry.dev/benchmarking/running/
 
 The benchmark uses Warden's public `sentry-vulnerability-corpus.json`, groups
 findings by `(Sentry SHA, target file)`, reads each historical Sentry target
-file, builds Warden-style synthetic whole-file patches, splits/coalesces them
-with Warden's default chunking rules, and runs one Lash security-review turn per
-Warden chunk. Trusted runs execute each task in Docker and keep corpus findings
-out of the child process and per-task result artifacts. A completed analysis
-run is still a raw, non-comparable state until the runner finalizes raw chunk
-predictions through Warden-equivalent post-processing implemented in Lash:
-Warden-shaped finding normalization, title/location dedupe, a repo-aware
-verifier tool pass, and cross-location merge. Semantic scoring uses that
-finalized artifact, not the raw verifier-off rows.
+file, builds Warden-style synthetic whole-file patches, calls upstream Warden's
+built diff parser/split/coalesce modules for chunking, and runs one Lash
+security-review turn per Warden chunk. Trusted runs execute each task in Docker
+and keep corpus findings out of the child process and per-task result artifacts.
+A completed analysis run is still a raw, non-comparable state until the runner
+finalizes raw chunk predictions: Lash normalizes raw findings, upstream Warden's
+SDK performs deterministic title/location dedupe, Lash performs the repo-aware
+verifier pass and merge-group synthesis, and upstream Warden's SDK applies
+`applyMergeGroups`. Semantic scoring uses that finalized artifact, not the raw
+verifier-off rows.
 
 ## Setup
 
@@ -30,6 +31,14 @@ This downloads the corpus into:
 The Sentry repository mirror is created lazily under
 `.benchmarks/warden-sentry/workspace/` on the first real run. The clone uses
 Git partial clone filtering so blobs are fetched on demand.
+
+Comparable runs also require a built upstream Warden checkout at
+`/tmp/ref-warden`. The runner imports these public built modules directly:
+`packages/warden/dist/diff/parser.js`,
+`packages/warden/dist/diff/coalesce.js`, and
+`packages/warden/dist/sdk/extract.js`. If they are missing, the runner fails
+chunking or post-processing instead of falling back to a local clone of Warden
+logic.
 
 ## Run One Task
 
@@ -129,31 +138,35 @@ credits per million tokens; with 25 credits per USD, those map to
 
 ## Score Existing Run
 
-Semantic scoring is a separate first-class step because judge calls are
+Semantic scoring is a separate first-class step because grader calls are
 auxiliary benchmark work, not analysis work. The scorer requires both
-`warden-final.jsonl` and `summary.json` with `wardenComparable: true`, asks the
-configured provider to semantically match post-processed findings against
-Warden corpus entries, writes full score details, and patches `summary.json`'s
-`scoring` block. It refuses to score a run that has only raw `predictions.jsonl`
-or an errored finalization state, because verifier-off rows are not
-upstream-comparable benchmark results.
+`warden-final.jsonl` and `summary.json` with `wardenComparable: true`. It
+reproduces the published Sentry corpus result lane named
+`agent-semantic-match-pass`: each finalized emitted finding is scored against
+the same-SHA corpus findings shown to the grader, and unique
+`matchedCorpusIds` are aggregated into `knownFound`.
 
 ```sh
 bench/warden-sentry/run.sh \
   --score-run-dir .benchmarks/warden-sentry/runs/<run-id> \
-  --provider-id codex \
-  --model gpt-5.5 \
-  --variant high \
-  --score-batch-size 15 \
-  --input-cost-per-mtok 5 \
-  --output-cost-per-mtok 30 \
-  --cached-input-cost-per-mtok 0.5 \
-  --reasoning-cost-per-mtok 0
+  --provider-id anthropic \
+  --model claude-sonnet-4-6 \
+  --score-batch-size 8
 ```
 
-`--score-batch-size` controls judge-call parallelism. Scoring is auxiliary
-work, so bounded parallel judge calls do not change analysis behavior; the
-runner sorts score rows by task order before writing artifacts.
+Set the provider API key for the configured scoring model, such as
+`ANTHROPIC_API_KEY` for Anthropic. The canonical score artifact follows the
+published result shape: top-level `runId`, `corpusId`, `scoring`, and `scores`,
+with `scoring.reviewer: "agent-semantic-match-pass"` and per-finding
+`findingId`, `matchedCorpusIds`, `verdict`, and `notes` rows.
+
+`--score-batch-size` controls semantic-match call parallelism. Scoring is
+auxiliary work, so bounded parallel grader calls do not change analysis
+behavior; the runner sorts score rows by finalized finding order before writing
+artifacts. The progress file
+`semantic-scoring.agent-semantic-match-pass.progress.jsonl` is resumable and
+records per-call token usage for audit, but it is not the canonical comparison
+result.
 
 Score artifacts, after a finalized comparable run:
 
@@ -168,9 +181,6 @@ Any `semantic-scoring.<prior-input-state>.*` files in the same directory are
 historical non-comparable stale artifacts retained only for audit. Their
 metadata records the actual previous input state/artifact and must not be used
 as finalized comparison scores.
-
-Use `--score-allow-partial` only for debugging; partial scoring updates the
-summary with `scoring.status: "partial"`.
 
 `--score-run-dir` scores every finalized chunk row in that run directory. Task
 selectors such as `--limit`, `--task-id`, `--finding-id`, `--sha`, and
@@ -191,8 +201,7 @@ any publishing invariant is broken: 156 chunk records plus one summary record
 in `warden-final.jsonl`, verifier and merge artifact counts matching
 post-processing metadata, stale scoring artifacts renamed/listed/marked
 non-comparable with prior input metadata, semantic scoring internals matching
-`summary.json`, semantic scoring using `warden-final.jsonl`,
-`wardenComparable: true`, and matching scan/auxiliary/total costs across
+`summary.json`, `wardenComparable: true`, and matching scan/auxiliary/total costs across
 `summary.json`, `post-processing/summary.json`, and `warden-final.jsonl`.
 
 Useful selectors:
@@ -244,20 +253,22 @@ not store corpus finding ids or summaries. Findings outside the chunk line
 range are dropped before raw result totals, matching Warden's defense-in-depth
 hunk filter.
 
-`warden-final.jsonl` is the Warden-equivalent finalized output emitted by
-Lash. It contains one schema-versioned chunk record per task plus a trailing
-summary record. Its findings are Warden `Finding` records after normalization,
-dedupe, verification, and cross-location merge. Its `usageBreakdown` separates
-scan usage from auxiliary verification/merge usage and includes total usage.
-The post-processing summary and top-level summary carry the same auxiliary and
-total cost accounting.
+`warden-final.jsonl` is the finalized Warden-compatible output emitted by Lash.
+It contains one schema-versioned chunk record per task plus a trailing summary
+record. Its findings are Warden `Finding` records after Lash normalization,
+upstream Warden SDK dedupe, Lash verification, Lash merge-group synthesis, and
+upstream Warden SDK `applyMergeGroups`. Its `usageBreakdown` separates scan
+usage from auxiliary verification/merge usage and includes total usage. The
+post-processing summary and top-level summary carry the same auxiliary and total
+cost accounting.
 
 `post-processing/reproducibility-manifest.json` records the runner git SHA,
 git status, source tree hash, git diff hash, reconstructible source snapshot
 artifact/hash, current binary hash, corpus hash, upstream Warden reference SHA,
-upstream bridge probe result, model/provider/variant, prompt/schema hashes,
-Docker image digest, and cost config. `cleanState` and `cleanStateWarning` are
-reproducibility signals only; they do not replace the artifact-level
+upstream bridge probe result, model/provider/variant, prompt/schema hashes
+including the semantic-match response schema, Docker image digest, and cost
+config. `cleanState` and `cleanStateWarning` are reproducibility signals only;
+they do not replace the artifact-level
 `wardenComparable` marker.
 
 On `--resume`, the runner reconciles `predictions.jsonl` with durable per-task
@@ -293,9 +304,8 @@ comparison fields:
   rollups with total/min/p50/p75/p90/p95/max milliseconds.
 - shard summaries grouped by Sentry SHA, matching Warden's by-SHA benchmark
   reporting model.
-- semantic scoring, after post-processing and `--score-run-dir`, including
-  the finalized input artifact, known-found recall, precision-ish known-match
-  rate, score artifact paths, and judge metadata.
+- semantic scoring, after post-processing and `--score-run-dir`, with the
+  published `agent-semantic-match-pass` score block and per-finding score rows.
 
 ## Notes
 
@@ -303,10 +313,11 @@ comparison fields:
   `--execution-mode rlm` to run the same target through Lash RLM.
 - The harness intentionally reviews only corpus target files, matching Warden's
   runbook guidance not to scan all of Sentry.
-- Chunking follows Warden's file-target path: treat the full target file as an
-  added patch, split large hunks at 8,000 UTF-16 code units, coalesce chunks
-  within 30 lines when the combined size stays under 8,000, and include 20
-  context lines before and after the hunk.
+- Chunking calls upstream Warden's built parser/split/coalesce modules on the
+  file-target path: treat the full target file as an added patch, split large
+  hunks at 8,000 UTF-16 code units, coalesce chunks within 30 lines when the
+  combined size stays under 8,000, and include 20 context lines before and after
+  the hunk.
 - `summary.json` starts with `wardenComparable: false`,
   `comparisonState: "raw-unfinalized"`, and `scoring.status: "unscored"`.
   Post-processing marks successful finalization with `wardenComparable: true`
@@ -315,16 +326,16 @@ comparison fields:
 - Raw `predictions.jsonl` rows are useful for audit/debugging, but are not
   publishable comparison rows until `warden-final.jsonl` has been produced and
   `summary.json` says `wardenComparable: true`.
-- Use the claim "Warden-equivalent post-processing semantics via Lash tools"
-  for these rows. Do not claim full upstream Warden runtime/tool execution
-  unless the verifier uses upstream Warden runtime/tool execution directly and
-  that lane configuration is recorded in the reproducibility manifest.
-- Rust tests include fixed post-processing/verifier/merge parity fixtures
-  snapshotted from `/tmp/ref-warden`, plus a controlled upstream TypeScript
-  bridge probe. In this environment the probe records that `/tmp/ref-warden`
-  lacks installed package dependencies, so the Rust suite asserts the blocker
-  and the exact contract snapshot instead of silently pretending the upstream
-  code executed.
+- Use the claim "upstream Warden SDK chunking/dedupe/merge-application with
+  Lash analysis, verifier, merge synthesis, and published
+  `agent-semantic-match-pass` semantic grading." Do not claim full upstream
+  Warden runtime/tool execution unless the verifier also uses upstream Warden
+  runtime/tool execution directly and that lane configuration is recorded in the
+  reproducibility manifest.
+- Rust tests include bridge-backed chunking, dedupe, and merge-application
+  fixtures against `/tmp/ref-warden` when the built upstream modules are
+  available. If the checkout/build is missing, bridge-dependent tests skip the
+  assertion, while real comparable runs fail loudly.
 - `predictions.jsonl` is rejected on resume/scoring if it contains duplicate
   task rows.
 - Pass `--keep-worktrees` when debugging a task checkout; otherwise task

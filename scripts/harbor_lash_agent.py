@@ -243,6 +243,22 @@ class LashAgent(BaseInstalledAgent):
 
         await super().setup(environment)
 
+    async def _scrub_remote_secrets(self, environment: BaseEnvironment) -> None:
+        try:
+            await environment.exec(
+                command=f"rm -f {shlex.quote(REMOTE_LASH_CONFIG)}",
+                timeout_sec=10,
+            )
+        except Exception:  # pragma: no cover - best effort cleanup
+            self.logger.debug("Failed to scrub remote lash config", exc_info=True)
+
+    def _scrub_local_secrets(self) -> None:
+        config_path = self.logs_dir / "lash-home" / "config.json"
+        try:
+            config_path.unlink(missing_ok=True)
+        except Exception:  # pragma: no cover - best effort cleanup
+            self.logger.debug("Failed to scrub local lash config", exc_info=True)
+
     def create_run_agent_commands(self, instruction: str) -> list[ExecInput]:
         execution_mode = os.environ.get("LASH_BENCH_EXECUTION_MODE", "").strip()
         if execution_mode not in {"rlm", "standard"}:
@@ -335,35 +351,39 @@ class LashAgent(BaseInstalledAgent):
             if self._prompt_template_path
             else instruction
         )
-        for i, exec_input in enumerate(self.create_run_agent_commands(rendered_instruction)):
-            command_dir = self.logs_dir / f"command-{i}"
-            command_dir.mkdir(parents=True, exist_ok=True)
-            (command_dir / "command.txt").write_text(exec_input.command)
-            (command_dir / "metadata.json").write_text(
-                json.dumps(self._command_metadata(exec_input.command), indent=2) + "\n"
-            )
-
-            result = await environment.exec(
-                command=self._timed_command(exec_input.command, i),
-                cwd=exec_input.cwd,
-                env=exec_input.env,
-                timeout_sec=exec_input.timeout_sec,
-            )
-
-            (command_dir / "return-code.txt").write_text(str(result.return_code))
-            if result.stdout:
-                (command_dir / "stdout.txt").write_text(result.stdout)
-            if result.stderr:
-                (command_dir / "stderr.txt").write_text(result.stderr)
-            try:
-                await environment.download_file(
-                    source_path=f"/logs/agent/command-{i}/resource-usage.txt",
-                    target_path=command_dir / "resource-usage.txt",
+        try:
+            for i, exec_input in enumerate(self.create_run_agent_commands(rendered_instruction)):
+                command_dir = self.logs_dir / f"command-{i}"
+                command_dir.mkdir(parents=True, exist_ok=True)
+                (command_dir / "command.txt").write_text(exec_input.command)
+                (command_dir / "metadata.json").write_text(
+                    json.dumps(self._command_metadata(exec_input.command), indent=2) + "\n"
                 )
-            except Exception:  # pragma: no cover - best effort
-                self.logger.debug(
-                    "Failed to download resource usage for command-%s", i, exc_info=True
+
+                result = await environment.exec(
+                    command=self._timed_command(exec_input.command, i),
+                    cwd=exec_input.cwd,
+                    env=exec_input.env,
+                    timeout_sec=exec_input.timeout_sec,
                 )
+
+                (command_dir / "return-code.txt").write_text(str(result.return_code))
+                if result.stdout:
+                    (command_dir / "stdout.txt").write_text(result.stdout)
+                if result.stderr:
+                    (command_dir / "stderr.txt").write_text(result.stderr)
+                try:
+                    await environment.download_file(
+                        source_path=f"/logs/agent/command-{i}/resource-usage.txt",
+                        target_path=command_dir / "resource-usage.txt",
+                    )
+                except Exception:  # pragma: no cover - best effort
+                    self.logger.debug(
+                        "Failed to download resource usage for command-%s", i, exc_info=True
+                    )
+        finally:
+            await self._scrub_remote_secrets(environment)
+            self._scrub_local_secrets()
         self.populate_context_post_run(context)
 
     def _read_assistant_response(self) -> str | None:
@@ -401,7 +421,7 @@ class LashAgent(BaseInstalledAgent):
                                 continue
                             n_input_tokens += int(usage.get("input_tokens") or 0)
                             n_output_tokens += int(usage.get("output_tokens") or 0)
-                            n_cache_tokens += int(usage.get("cached_input_tokens") or 0)
+                            n_cache_tokens += int(usage.get("cache_read_input_tokens") or 0)
                             saw_usage = True
                 except Exception as exc:  # pragma: no cover - defensive, non-fatal
                     self.logger.warning("Failed to parse lash usage from %s: %s", path, exc)

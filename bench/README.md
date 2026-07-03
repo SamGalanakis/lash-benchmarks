@@ -5,7 +5,7 @@
   - `scripts/profile_ui.py` writes `.benchmarks/ui-perf/*.json`.
   - `scripts/profile_lashlang.py` writes `.benchmarks/lashlang-perf/*.json`.
   - `scripts/perfreport.py <report.json>` summarizes or diffs those reports.
-- [terminalbench2](./terminalbench2/README.md): Harbor + Terminal Bench 2 harness for Lash and peer agents.
+- [terminalbench2](./terminalbench2/README.md): Harbor + Terminal-Bench 2.1 harness for Lash and peer agents.
 - [appworld](./appworld/README.md): AppWorld MCP harness for evaluating Lash on task-world API workflows.
 - [warden-sentry](./warden-sentry/README.md): Direct Lash harness for Warden's Sentry vulnerability corpus, scoped to the corpus files at their recorded Sentry SHAs.
 - [continual-learning-bench](./continual-learning-bench/README.md): Thin local wrapper for running Lash as a cached system inside `pgasawa/continual-learning-bench`.

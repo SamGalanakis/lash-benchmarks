@@ -14,7 +14,7 @@ use clap::{Parser, ValueEnum};
 use dataset::{OolongQuestion, OolongSuite, default_dataset_path, load_questions};
 use lash::rlm::RlmTurnBuilderExt;
 use lash::{
-    ModelSpec, PluginStack, RlmCore, SessionSpec, TurnActivity, TurnActivitySink, TurnEvent,
+    LashCore, ModelSpec, PluginStack, SessionSpec, TurnActivity, TurnActivitySink, TurnEvent,
     TurnInput,
     prompt::{
         PromptBuiltin, PromptLayer, PromptSlot, PromptTemplate, PromptTemplateEntry,
@@ -688,26 +688,25 @@ async fn run_question(
         None,
     )
     .map_err(anyhow::Error::msg)?;
-    let core = RlmCore::builder()
-        .rlm_protocol_config(rlm_config(args))
-        .provider(provider.clone())
-        .model(model_spec)
-        .max_turns(args.max_turns)
-        .store_factory(Arc::new(
-            lash::persistence::InMemorySessionStoreFactory::new(),
-        ))
-        .process_registry(Arc::new(TestLocalProcessRegistry::default()))
-        .process_env_store(Arc::new(
-            lash::persistence::InMemoryProcessExecutionEnvStore::new(),
-        ))
-        .plugins(build_plugin_stack(args))
-        .effect_host(Arc::new(lash::durability::InlineEffectHost::default()))
-        .lashlang_artifact_store(Arc::new(
-            lash::persistence::InMemoryLashlangArtifactStore::new(),
-        ))
-        .attachment_store(Arc::new(lash::persistence::InMemoryAttachmentStore::new()))
-        .trace_jsonl_path(trace_path.clone())
-        .build()?;
+    let core = LashCore::rlm_builder(lash::rlm::RlmProtocolPluginFactory::new(
+        rlm_config(args),
+        Arc::new(lash::persistence::InMemoryLashlangArtifactStore::new()),
+    ))
+    .provider(provider.clone())
+    .model(model_spec)
+    .max_turns(args.max_turns)
+    .store_factory(Arc::new(
+        lash::persistence::InMemorySessionStoreFactory::new(),
+    ))
+    .process_registry(Arc::new(TestLocalProcessRegistry::default()))
+    .process_env_store(Arc::new(
+        lash::persistence::InMemoryProcessExecutionEnvStore::new(),
+    ))
+    .plugins(build_plugin_stack(args))
+    .effect_host(Arc::new(lash::durability::InlineEffectHost::default()))
+    .attachment_store(Arc::new(lash::persistence::InMemoryAttachmentStore::new()))
+    .trace_jsonl_path(trace_path.clone())
+    .build()?;
     let session = core
         .session("root")
         .store(store.clone() as Arc<dyn lash::persistence::RuntimePersistence>)
@@ -1147,7 +1146,7 @@ fn rlm_config(args: &Args) -> RlmProtocolPluginConfig {
         }
         if let Some(value) = args.forced_continue_as_tokens {
             eprintln!(
-                "warn: --forced-continue-as-tokens={value} is ignored by lash v0.1.0-alpha.78"
+                "warn: --forced-continue-as-tokens={value} is ignored by lash v0.1.0-alpha.82"
             );
         }
     }
@@ -1407,8 +1406,8 @@ fn aggregate_usage(reports: impl IntoIterator<Item = SessionUsageReport>) -> Ses
             let entry = total.entry(key).or_default();
             entry.input_tokens += row.usage.input_tokens;
             entry.output_tokens += row.usage.output_tokens;
-            entry.cached_input_tokens += row.usage.cached_input_tokens;
-            entry.reasoning_tokens += row.usage.reasoning_tokens;
+            entry.cache_read_input_tokens += row.usage.cache_read_input_tokens;
+            entry.reasoning_output_tokens += row.usage.reasoning_output_tokens;
         }
     }
     let entries = total

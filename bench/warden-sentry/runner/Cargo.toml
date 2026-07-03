@@ -15,8 +15,9 @@ lash = { workspace = true }
 lash-core = { workspace = true, features = ["testing"] }
 lash-standard-plugins = { workspace = true }
 lash-sqlite-store = { workspace = true }
-lash-llm-tools = { workspace = true }
-lash-subagents = { workspace = true }
+lash-plugin-observational-memory = { workspace = true }
+lash-search-tools = { workspace = true, features = ["lashlang"] }
+lash-tools = { workspace = true, features = ["lashlang"] }
 tokio = { workspace = true, features = ["full"] }
 tokio-util = { workspace = true, features = ["rt"] }
 clap = { workspace = true, features = ["derive", "env"] }

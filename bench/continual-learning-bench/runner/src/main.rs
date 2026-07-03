@@ -6,7 +6,7 @@ use anyhow::{Context, Result, bail};
 use clap::Parser;
 use lash::rlm::RlmTurnBuilderExt;
 use lash::{
-    ModelSpec, PluginStack, RlmCore, SessionSpec, TurnInput,
+    LashCore, ModelSpec, PluginStack, SessionSpec, TurnInput,
     persistence::{
         ProtocolEvent, RuntimePersistence, RuntimeSessionState, load_persisted_session_state,
     },
@@ -104,24 +104,23 @@ async fn run_query(request: RunnerRequest) -> Result<RunnerResponse> {
         None,
     )
     .map_err(anyhow::Error::msg)?;
-    let mut core_builder = RlmCore::builder()
-        .rlm_protocol_config(clbench_rlm_config())
-        .provider(provider)
-        .model(model_spec)
-        .max_turns(request.max_turns.unwrap_or(DEFAULT_MAX_TURNS))
-        .store_factory(Arc::new(
-            lash::persistence::InMemorySessionStoreFactory::new(),
-        ))
-        .process_registry(Arc::new(TestLocalProcessRegistry::default()))
-        .process_env_store(Arc::new(
-            lash::persistence::InMemoryProcessExecutionEnvStore::new(),
-        ))
-        .effect_host(Arc::new(lash::durability::InlineEffectHost::default()))
-        .lashlang_artifact_store(Arc::new(
-            lash::persistence::InMemoryLashlangArtifactStore::new(),
-        ))
-        .attachment_store(Arc::new(lash::persistence::InMemoryAttachmentStore::new()))
-        .plugins(build_plugin_stack());
+    let mut core_builder = LashCore::rlm_builder(lash::rlm::RlmProtocolPluginFactory::new(
+        clbench_rlm_config(),
+        Arc::new(lash::persistence::InMemoryLashlangArtifactStore::new()),
+    ))
+    .provider(provider)
+    .model(model_spec)
+    .max_turns(request.max_turns.unwrap_or(DEFAULT_MAX_TURNS))
+    .store_factory(Arc::new(
+        lash::persistence::InMemorySessionStoreFactory::new(),
+    ))
+    .process_registry(Arc::new(TestLocalProcessRegistry::default()))
+    .process_env_store(Arc::new(
+        lash::persistence::InMemoryProcessExecutionEnvStore::new(),
+    ))
+    .effect_host(Arc::new(lash::durability::InlineEffectHost::default()))
+    .attachment_store(Arc::new(lash::persistence::InMemoryAttachmentStore::new()))
+    .plugins(build_plugin_stack());
     if let Some(trace_path) = request.trace_path.clone() {
         core_builder = core_builder.trace_jsonl_path(trace_path);
     }
@@ -342,27 +341,26 @@ mod tests {
 
     #[tokio::test]
     async fn clbench_rlm_tool_surface_exposes_explicit_limited_tools() {
-        let core = RlmCore::builder()
-            .rlm_protocol_config(clbench_rlm_config())
-            .model(
-                ModelSpec::from_token_limits("mock-model", None, DEFAULT_MAX_CONTEXT_TOKENS, None)
-                    .expect("valid model spec"),
-            )
-            .store_factory(Arc::new(
-                lash::persistence::InMemorySessionStoreFactory::new(),
-            ))
-            .process_registry(Arc::new(TestLocalProcessRegistry::default()))
-            .process_env_store(Arc::new(
-                lash::persistence::InMemoryProcessExecutionEnvStore::new(),
-            ))
-            .effect_host(Arc::new(lash::durability::InlineEffectHost::default()))
-            .lashlang_artifact_store(Arc::new(
-                lash::persistence::InMemoryLashlangArtifactStore::new(),
-            ))
-            .attachment_store(Arc::new(lash::persistence::InMemoryAttachmentStore::new()))
-            .plugins(build_plugin_stack())
-            .build()
-            .expect("core");
+        let core = LashCore::rlm_builder(lash::rlm::RlmProtocolPluginFactory::new(
+            clbench_rlm_config(),
+            Arc::new(lash::persistence::InMemoryLashlangArtifactStore::new()),
+        ))
+        .model(
+            ModelSpec::from_token_limits("mock-model", None, DEFAULT_MAX_CONTEXT_TOKENS, None)
+                .expect("valid model spec"),
+        )
+        .store_factory(Arc::new(
+            lash::persistence::InMemorySessionStoreFactory::new(),
+        ))
+        .process_registry(Arc::new(TestLocalProcessRegistry::default()))
+        .process_env_store(Arc::new(
+            lash::persistence::InMemoryProcessExecutionEnvStore::new(),
+        ))
+        .effect_host(Arc::new(lash::durability::InlineEffectHost::default()))
+        .attachment_store(Arc::new(lash::persistence::InMemoryAttachmentStore::new()))
+        .plugins(build_plugin_stack())
+        .build()
+        .expect("core");
         let session = core.session("root").open().await.expect("session");
 
         let mut ordinary_names = session

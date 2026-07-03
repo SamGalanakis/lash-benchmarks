@@ -14,20 +14,23 @@ LASH_GIT_URL="${LASH_GIT_URL:-https://github.com/SamGalanakis/lash}"
 LASH_GIT_TAG="${LASH_GIT_TAG:-}"
 LASH_GIT_BRANCH="${LASH_GIT_BRANCH:-}"
 LASH_GIT_REV="${LASH_GIT_REV:-}"
+TERMINALBENCH_DATASET="terminal-bench/terminal-bench-2-1"
+LEADERBOARD_CODEX_VERSION="0.125.0"
 
 usage() {
   cat <<'EOF'
-Run Terminal Bench 2 via Harbor.
+Run Terminal-Bench 2.1 via Harbor.
 
 Usage:
   scripts/run-terminalbench.sh [options] [-- <extra harbor args>]
 
 Options:
   --agent <name>                Agent to run: lash|opencode|codex (default: lash)
-  --dataset <name@version>      Dataset to run (default: terminal-bench-sample@2.0)
-  --sample                      Shortcut for --dataset terminal-bench-sample@2.0
-  --full                        Shortcut for --dataset terminal-bench@2.0
-  --preset <name>               Exact task preset: trivial|smoke|fast-3|fast-medium|memory-3|recall-3|representative-10
+  --dataset <org/name>          Dataset to run (default: terminal-bench/terminal-bench-2-1)
+  --full                        Shortcut for the canonical Terminal-Bench 2.1 dataset
+  --leaderboard-codex           Match the published Terminal-Bench 2.1 Codex CLI row:
+                                codex, gpt-5.5, high effort, Codex CLI 0.125.0, k=5
+  --preset <name>               Exact task preset: trivial|smoke|smoke-5|fast-3|fast-medium|memory-3|recall-3|representative-10|representative-20
   --task <glob>                 Task include pattern (repeatable)
   --tasks <a,b,c>               Exact task names as a comma-separated list
   --task-file <path>            Exact task names from a file (one per line, # comments allowed)
@@ -37,7 +40,9 @@ Options:
   --provider <kind>             Lash provider key to activate for this run
                                 (for example: codex; optional for --agent lash)
   --variant <name>              Provider-native model variant passed through when supported
-                                (required for all benchmark runs)
+                                (required for lash/opencode; default high for codex)
+  --codex-version <version>     Codex CLI npm version for --agent codex (default: latest;
+                                leaderboard row reports 0.125.0)
   --execution-mode <mode>       Lash execution mode: rlm|standard
                                 (required for --agent lash; ignored for opencode)
   --context-approach <name>     Lash standard-mode context approach:
@@ -51,8 +56,8 @@ Options:
   --attempts <int>              Attempts per trial (default: 1)
   --timeout-multiplier <float>  Task timeout multiplier (default: 1.0)
   --env <name>                  Harbor environment backend (default: docker)
-  --registry-url <url>          Dataset registry URL
-                                (default: https://raw.githubusercontent.com/laude-institute/harbor/main/registry.json)
+  --registry-url <url>          Optional dataset registry override
+                                (default: Harbor CLI default)
   --build-mode <mode>           Lash build mode: host|docker-bookworm|docker-bullseye
                                 (default: docker-bookworm)
   --no-build                    Skip building the lash benchmark binary
@@ -60,26 +65,33 @@ Options:
   --no-debug                    Disable Harbor debug logging (default)
   --delete                      Delete benchmark environments after run
   --no-delete                   Keep benchmark environments after run
+  --reuse-completed             Reuse completed matching task attempts from
+                                previous structured runs and skip rerunning
+                                tasks with enough attempts
+  --reuse-from <path>           Restrict reuse to a structured run directory
+                                or run.json (repeatable; implies
+                                --reuse-completed)
   --allow-no-config             Do not require ~/.lash/config.json for lash runs
   --dry-run                     Print command and exit
   --help                        Show this help
 
 Examples:
-  scripts/run-terminalbench.sh --sample --execution-mode rlm --variant high
-  scripts/run-terminalbench.sh --sample --execution-mode rlm --provider codex --model gpt-5.5 --variant high
-  scripts/run-terminalbench.sh --sample --preset trivial --execution-mode rlm --model gpt-5.5 --variant high
-  scripts/run-terminalbench.sh --sample --preset smoke --execution-mode rlm --model gpt-5.5 --variant high
-  scripts/run-terminalbench.sh --sample --preset fast-3 --execution-mode standard --model gpt-5.5 --variant high
-  scripts/run-terminalbench.sh --sample --preset fast-medium --execution-mode standard --model gpt-5.5 --variant high
-  scripts/run-terminalbench.sh --full --preset memory-3 --execution-mode standard --model gpt-5.5 --variant high
-  scripts/run-terminalbench.sh --full --preset recall-3 --execution-mode standard --model gpt-5.5 --variant high
-  scripts/run-terminalbench.sh --full --preset representative-10 --execution-mode standard --model gpt-5.5 --variant high
+  scripts/run-terminalbench.sh --execution-mode rlm --variant high
+  scripts/run-terminalbench.sh --execution-mode rlm --provider codex --model gpt-5.5 --variant high
+  scripts/run-terminalbench.sh --preset trivial --execution-mode rlm --model gpt-5.5 --variant high
+  scripts/run-terminalbench.sh --preset smoke --execution-mode rlm --model gpt-5.5 --variant high
+  scripts/run-terminalbench.sh --preset fast-3 --execution-mode standard --model gpt-5.5 --variant high
+  scripts/run-terminalbench.sh --preset fast-medium --execution-mode standard --model gpt-5.5 --variant high
+  scripts/run-terminalbench.sh --preset memory-3 --execution-mode standard --model gpt-5.5 --variant high
+  scripts/run-terminalbench.sh --preset recall-3 --execution-mode standard --model gpt-5.5 --variant high
+  scripts/run-terminalbench.sh --preset representative-10 --execution-mode standard --model gpt-5.5 --variant high
   scripts/run-terminalbench.sh --full --execution-mode standard --task "git-*" --variant high
-  scripts/run-terminalbench.sh --sample --execution-mode standard --tasks regex-log,fix-code-vulnerability --variant high
-  scripts/run-terminalbench.sh --sample --execution-mode standard --context-approach rolling_history --model gpt-5.5 --variant high
-  scripts/run-terminalbench.sh --sample --execution-mode rlm --task chess-best-move --model gpt-5.5 --variant high
-  scripts/run-terminalbench.sh --agent opencode --sample --model openai/gpt-5.5 --variant high
-  scripts/run-terminalbench.sh --agent codex --sample --model gpt-5.5 --variant high
+  scripts/run-terminalbench.sh --execution-mode standard --tasks regex-log,fix-code-vulnerability --variant high
+  scripts/run-terminalbench.sh --execution-mode standard --context-approach rolling_history --model gpt-5.5 --variant high
+  scripts/run-terminalbench.sh --execution-mode rlm --task chess-best-move --model gpt-5.5 --variant high
+  scripts/run-terminalbench.sh --agent opencode --model openai/gpt-5.5 --variant high
+  scripts/run-terminalbench.sh --leaderboard-codex
+  scripts/run-terminalbench.sh --agent codex --model gpt-5.5 --variant high --codex-version 0.125.0 --attempts 5
 EOF
 }
 
@@ -119,7 +131,7 @@ lash_ref_label() {
   fi
 }
 
-DATASET="terminal-bench-sample@2.0"
+DATASET="${TERMINALBENCH_DATASET}"
 AGENT="lash"
 JOBS_DIR="jobs"
 RESULTS_DIR=".benchmarks/terminalbench2"
@@ -127,6 +139,7 @@ JOB_NAME=""
 MODEL=""
 LASH_PROVIDER_KIND=""
 VARIANT=""
+CODEX_AGENT_VERSION=""
 EXECUTION_MODE=""
 CONTEXT_APPROACH=""
 BUILD_MODE="docker-bookworm"
@@ -135,18 +148,24 @@ N_CONCURRENT_SET=0
 ATTEMPTS="1"
 TIMEOUT_MULT="1.0"
 ENV_BACKEND="docker"
-REGISTRY_URL="https://raw.githubusercontent.com/laude-institute/harbor/main/registry.json"
+REGISTRY_URL=""
 DO_BUILD=1
 DELETE_AFTER_RUN=1
 REQUIRE_CONFIG=1
 DRY_RUN=0
 DEBUG=0
 TASK_PRESET=""
+REUSE_COMPLETED=0
+REUSE_PLAN_PATH=""
+REUSE_PROVIDER_KIND=""
+SKIP_HARBOR=0
 
 TASK_PATTERNS=()
 EXACT_TASKS=()
 EXCLUDE_PATTERNS=()
 EXTRA_ARGS=()
+REUSE_SOURCES=()
+REUSE_EXCLUDE_TASKS=()
 
 readonly PRESET_TRIVIAL_TASKS=(
   "log-summary-date-ranges"
@@ -155,6 +174,14 @@ readonly PRESET_TRIVIAL_TASKS=(
 readonly PRESET_SMOKE_TASKS=(
   "log-summary-date-ranges"
   "fix-code-vulnerability"
+)
+
+readonly PRESET_SMOKE_5_TASKS=(
+  "log-summary-date-ranges"
+  "regex-log"
+  "build-cython-ext"
+  "git-leak-recovery"
+  "nginx-request-logging"
 )
 
 readonly PRESET_FAST_3_TASKS=(
@@ -195,30 +222,63 @@ readonly PRESET_REPRESENTATIVE_10_TASKS=(
   "sqlite-with-gcov"
 )
 
+readonly PRESET_REPRESENTATIVE_20_TASKS=(
+  "build-cython-ext"
+  "compile-compcert"
+  "configure-git-webserver"
+  "db-wal-recovery"
+  "fix-code-vulnerability"
+  "git-leak-recovery"
+  "log-summary-date-ranges"
+  "make-doom-for-mips"
+  "mteb-leaderboard"
+  "nginx-request-logging"
+  "password-recovery"
+  "polyglot-c-py"
+  "pytorch-model-recovery"
+  "query-optimize"
+  "raman-fitting"
+  "regex-log"
+  "sanitize-git-repo"
+  "sparql-university"
+  "sqlite-with-gcov"
+  "torch-tensor-parallelism"
+)
+
 validate_task_preset_scope() {
-  case "${TASK_PRESET}" in
-    memory-3)
-      if [[ "${DATASET}" != "terminal-bench@2.0" ]]; then
-        echo "error: --preset memory-3 requires --dataset terminal-bench@2.0 (or --full)." >&2
-        echo "requested dataset: ${DATASET}" >&2
-        exit 2
-      fi
-      ;;
-    recall-3)
-      if [[ "${DATASET}" != "terminal-bench@2.0" ]]; then
-        echo "error: --preset recall-3 requires --dataset terminal-bench@2.0 (or --full)." >&2
-        echo "requested dataset: ${DATASET}" >&2
-        exit 2
-      fi
-      ;;
-    representative-10)
-      if [[ "${DATASET}" != "terminal-bench@2.0" ]]; then
-        echo "error: --preset representative-10 requires --dataset terminal-bench@2.0 (or --full)." >&2
-        echo "requested dataset: ${DATASET}" >&2
-        exit 2
-      fi
+  if [[ -z "${TASK_PRESET}" ]]; then
+    return 0
+  fi
+  if [[ "${DATASET}" != "${TERMINALBENCH_DATASET}" ]]; then
+    echo "error: --preset ${TASK_PRESET} is defined for ${TERMINALBENCH_DATASET}." >&2
+    echo "requested dataset: ${DATASET}" >&2
+    exit 2
+  fi
+}
+
+validate_dataset_cutover() {
+  case "${DATASET}" in
+    terminal-bench@2.0|terminal-bench-sample@2.0|terminal-bench/terminal-bench-2)
+      echo "error: ${DATASET} is a superseded Terminal-Bench 2.0 dataset." >&2
+      echo "use ${TERMINALBENCH_DATASET} for Terminal-Bench 2.1." >&2
+      exit 2
       ;;
   esac
+}
+
+strip_terminalbench_task_prefix() {
+  local value="$1"
+  value="${value#terminal-bench/}"
+  printf '%s' "${value}"
+}
+
+harbor_task_filter_name() {
+  local task_name="$1"
+  if [[ "${DATASET}" == "${TERMINALBENCH_DATASET}" && "${task_name}" != */* ]]; then
+    printf 'terminal-bench/%s' "${task_name}"
+  else
+    printf '%s' "${task_name}"
+  fi
 }
 
 validate_exact_task_execution() {
@@ -227,9 +287,39 @@ validate_exact_task_execution() {
     return 0
   fi
 
-  local requested_csv actual_csv
-  requested_csv="$(printf '%s\n' "${EXACT_TASKS[@]}" | sort -u | paste -sd, -)"
-  actual_csv="$(find "${job_dir}" -mindepth 1 -maxdepth 1 -type d -name '*__*' -printf '%f\n' | sed 's/__.*//' | sort -u | paste -sd, -)"
+  local requested_csv actual_csv task_name
+  local requested_tasks=()
+  for task_name in "${EXACT_TASKS[@]}"; do
+    requested_tasks+=("$(strip_terminalbench_task_prefix "${task_name}")")
+  done
+  requested_csv="$(printf '%s\n' "${requested_tasks[@]}" | sort -u | paste -sd, -)"
+  actual_csv="$(python3 - "${job_dir}" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+job_dir = Path(sys.argv[1])
+names = set()
+for result_path in sorted(job_dir.glob("*__*/result.json")):
+    try:
+        data = json.loads(result_path.read_text())
+    except (OSError, json.JSONDecodeError):
+        continue
+    name = data.get("task_name")
+    if not isinstance(name, str) or not name.strip():
+        name = result_path.parent.name.split("__", 1)[0]
+    name = name.strip()
+    if name.startswith("terminal-bench/"):
+        name = name.removeprefix("terminal-bench/")
+    if name:
+        names.add(name)
+
+print(",".join(sorted(names)))
+PY
+)"
+  if [[ -z "${actual_csv}" ]]; then
+    actual_csv="$(find "${job_dir}" -mindepth 1 -maxdepth 1 -type d -name '*__*' -printf '%f\n' | sed 's/__.*//; s#^terminal-bench/##' | sort -u | paste -sd, -)"
+  fi
 
   if [[ "${requested_csv}" != "${actual_csv}" ]]; then
     echo "error: exact-task benchmark scope mismatch; refusing to export an ambiguous run." >&2
@@ -277,6 +367,9 @@ apply_task_preset() {
     smoke)
       EXACT_TASKS+=("${PRESET_SMOKE_TASKS[@]}")
       ;;
+    smoke-5)
+      EXACT_TASKS+=("${PRESET_SMOKE_5_TASKS[@]}")
+      ;;
     fast-3)
       EXACT_TASKS+=("${PRESET_FAST_3_TASKS[@]}")
       ;;
@@ -292,8 +385,11 @@ apply_task_preset() {
     representative-10)
       EXACT_TASKS+=("${PRESET_REPRESENTATIVE_10_TASKS[@]}")
       ;;
+    representative-20)
+      EXACT_TASKS+=("${PRESET_REPRESENTATIVE_20_TASKS[@]}")
+      ;;
     *)
-      echo "error: unsupported --preset: ${preset} (expected trivial|smoke|fast-3|fast-medium|memory-3|recall-3|representative-10)" >&2
+      echo "error: unsupported --preset: ${preset} (expected trivial|smoke|smoke-5|fast-3|fast-medium|memory-3|recall-3|representative-10|representative-20)" >&2
       exit 2
       ;;
   esac
@@ -319,6 +415,18 @@ sanitize_job_fragment() {
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
+    --leaderboard-codex)
+      DATASET="${TERMINALBENCH_DATASET}"
+      AGENT="codex"
+      MODEL="gpt-5.5"
+      VARIANT="high"
+      CODEX_AGENT_VERSION="${LEADERBOARD_CODEX_VERSION}"
+      ATTEMPTS="5"
+      if [[ "${N_CONCURRENT_SET}" -eq 0 ]]; then
+        N_CONCURRENT="4"
+      fi
+      shift
+      ;;
     --agent)
       AGENT="${2:?missing value for --agent}"
       shift 2
@@ -327,12 +435,8 @@ while [[ $# -gt 0 ]]; do
       DATASET="${2:?missing value for --dataset}"
       shift 2
       ;;
-    --sample)
-      DATASET="terminal-bench-sample@2.0"
-      shift
-      ;;
     --full)
-      DATASET="terminal-bench@2.0"
+      DATASET="${TERMINALBENCH_DATASET}"
       shift
       ;;
     --preset)
@@ -366,6 +470,10 @@ while [[ $# -gt 0 ]]; do
       ;;
     --variant)
       VARIANT="${2:?missing value for --variant}"
+      shift 2
+      ;;
+    --codex-version)
+      CODEX_AGENT_VERSION="${2:?missing value for --codex-version}"
       shift 2
       ;;
     --execution-mode)
@@ -433,6 +541,15 @@ while [[ $# -gt 0 ]]; do
       DELETE_AFTER_RUN=0
       shift
       ;;
+    --reuse-completed)
+      REUSE_COMPLETED=1
+      shift
+      ;;
+    --reuse-from)
+      REUSE_COMPLETED=1
+      REUSE_SOURCES+=("${2:?missing value for --reuse-from}")
+      shift 2
+      ;;
     --allow-no-config)
       REQUIRE_CONFIG=0
       shift
@@ -468,8 +585,8 @@ if [[ -n "${LASH_PROVIDER_KIND}" && "${AGENT}" != "lash" ]]; then
   exit 2
 fi
 
-if [[ -z "${VARIANT}" ]]; then
-  echo "error: --variant is required for benchmark runs" >&2
+if [[ -z "${VARIANT}" && "${AGENT}" != "codex" ]]; then
+  echo "error: --variant is required for ${AGENT} benchmark runs" >&2
   exit 2
 fi
 
@@ -477,6 +594,7 @@ if [[ ${#EXACT_TASKS[@]} -gt 0 ]]; then
   mapfile -t EXACT_TASKS < <(printf '%s\n' "${EXACT_TASKS[@]}" | awk '!seen[$0]++')
 fi
 
+validate_dataset_cutover
 validate_task_preset_scope
 
 if [[ ${#EXACT_TASKS[@]} -gt 0 && "${N_CONCURRENT_SET}" -eq 0 ]]; then
@@ -609,7 +727,11 @@ elif [[ "${AGENT}" == "codex" ]]; then
   if [[ -n "${CONTEXT_APPROACH}" ]]; then
     echo "warning: --context-approach is ignored for --agent codex" >&2
   fi
-  export CODEX_BENCH_MODEL_VARIANT="${VARIANT}"
+  if [[ -z "${MODEL}" ]]; then
+    echo "error: --model is required for --agent codex" >&2
+    exit 2
+  fi
+  VARIANT="${VARIANT:-high}"
 fi
 
 export PYTHONPATH="${REPO_ROOT}:${PYTHONPATH:-}"
@@ -667,10 +789,30 @@ fi
 
 PROVIDER_CONFIG_PATH="${HOME}/.lash/config.json"
 if [[ "${AGENT}" == "lash" && -f "${HOME}/.lash/config.json" ]]; then
-  provider_config_dir="${RESULTS_DIR}/provider-configs"
-  mkdir -p "${provider_config_dir}"
-  PROVIDER_CONFIG_PATH="$(cd -- "${provider_config_dir}" && pwd)/${JOB_NAME}.json"
-  python3 - "${HOME}/.lash/config.json" "${PROVIDER_CONFIG_PATH}" "${LASH_PROVIDER_KIND}" <<'PY'
+  if [[ "${DRY_RUN}" -eq 1 ]]; then
+    if [[ -n "${LASH_PROVIDER_KIND}" ]]; then
+      python3 - "${HOME}/.lash/config.json" "${LASH_PROVIDER_KIND}" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+source = Path(sys.argv[1])
+provider = sys.argv[2]
+
+data = json.loads(source.read_text())
+providers = data.get("providers")
+if not isinstance(providers, dict) or provider not in providers:
+    available = ", ".join(sorted(providers)) if isinstance(providers, dict) else "<none>"
+    raise SystemExit(
+        f"error: provider `{provider}` is not configured in {source}; available: {available}"
+    )
+PY
+    fi
+  else
+    provider_config_dir="${RESULTS_DIR}/provider-configs"
+    mkdir -p "${provider_config_dir}"
+    PROVIDER_CONFIG_PATH="$(cd -- "${provider_config_dir}" && pwd)/${JOB_NAME}.json"
+    python3 - "${HOME}/.lash/config.json" "${PROVIDER_CONFIG_PATH}" "${LASH_PROVIDER_KIND}" <<'PY'
 import json
 import sys
 from pathlib import Path
@@ -699,13 +841,93 @@ if isinstance(auxiliary, dict):
         data.pop("auxiliary_secrets", None)
 target.write_text(json.dumps(data, indent=2) + "\n")
 PY
-  export LASH_BENCH_CONFIG="${PROVIDER_CONFIG_PATH}"
+    export LASH_BENCH_CONFIG="${PROVIDER_CONFIG_PATH}"
+  fi
+fi
+
+if [[ "${REUSE_COMPLETED}" -eq 1 ]]; then
+  REUSE_PROVIDER_KIND="${LASH_PROVIDER_KIND}"
+  if [[ "${AGENT}" == "lash" && -z "${REUSE_PROVIDER_KIND}" && -f "${PROVIDER_CONFIG_PATH}" ]]; then
+    REUSE_PROVIDER_KIND="$(python3 - "${PROVIDER_CONFIG_PATH}" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+path = Path(sys.argv[1])
+try:
+    data = json.loads(path.read_text())
+except Exception:
+    print("")
+else:
+    value = data.get("active_provider")
+    print(value if isinstance(value, str) else "")
+PY
+)"
+  fi
+
+  reuse_plan_dir="${RESULTS_DIR}/reuse-plans"
+  mkdir -p "${reuse_plan_dir}"
+  REUSE_PLAN_PATH="$(cd -- "${reuse_plan_dir}" && pwd)/${JOB_NAME}.json"
+  REUSE_PLAN_CMD=(
+    python3 "${SCRIPT_DIR}/terminalbench_reuse.py"
+    plan
+    --results-dir "${RESULTS_DIR}"
+    --plan-path "${REUSE_PLAN_PATH}"
+    --agent "${AGENT}"
+    --dataset "${DATASET}"
+    --execution-mode "${RUN_EXECUTION_MODE}"
+    --harbor-env "${ENV_BACKEND}"
+    --attempts "${ATTEMPTS}"
+    --timeout-multiplier "${TIMEOUT_MULT}"
+  )
+  if [[ -n "${MODEL}" ]]; then
+    REUSE_PLAN_CMD+=(--requested-model "${MODEL}")
+  fi
+  if [[ -n "${VARIANT}" ]]; then
+    REUSE_PLAN_CMD+=(--variant "${VARIANT}")
+  fi
+  if [[ -n "${CONTEXT_APPROACH}" ]]; then
+    REUSE_PLAN_CMD+=(--context-approach "${CONTEXT_APPROACH}")
+  fi
+  if [[ -n "${REUSE_PROVIDER_KIND}" ]]; then
+    REUSE_PLAN_CMD+=(--provider-kind "${REUSE_PROVIDER_KIND}")
+  fi
+  if [[ -n "${CODEX_AGENT_VERSION}" ]]; then
+    REUSE_PLAN_CMD+=(--agent-version "${CODEX_AGENT_VERSION}")
+  fi
+  for arg in "${EXTRA_ARGS[@]}"; do
+    REUSE_PLAN_CMD+=("--extra-arg=${arg}")
+  done
+  for task_name in "${EXACT_TASKS[@]}"; do
+    REUSE_PLAN_CMD+=(--requested-task "$(strip_terminalbench_task_prefix "${task_name}")")
+  done
+  for source in "${REUSE_SOURCES[@]}"; do
+    REUSE_PLAN_CMD+=(--reuse-from "${source}")
+  done
+
+  mapfile -t REUSE_EXCLUDE_TASKS < <("${REUSE_PLAN_CMD[@]}")
+  if [[ ${#REUSE_EXCLUDE_TASKS[@]} -gt 0 ]]; then
+    echo "==> Reusing completed attempts for ${#REUSE_EXCLUDE_TASKS[@]} task(s): ${REUSE_EXCLUDE_TASKS[*]}"
+    if [[ ${#EXACT_TASKS[@]} -gt 0 ]]; then
+      requested_reuse_csv="$(
+        for task_name in "${EXACT_TASKS[@]}"; do
+          strip_terminalbench_task_prefix "${task_name}"
+          printf '\n'
+        done | sort -u | paste -sd, -
+      )"
+      reusable_csv="$(printf '%s\n' "${REUSE_EXCLUDE_TASKS[@]}" | sort -u | paste -sd, -)"
+      if [[ "${requested_reuse_csv}" == "${reusable_csv}" ]]; then
+        SKIP_HARBOR=1
+      fi
+    fi
+  else
+    echo "==> Reuse requested, but no completed matching task attempts were found."
+  fi
 fi
 
 CMD=(
   harbor run
   --dataset "${DATASET}"
-  --registry-url "${REGISTRY_URL}"
   --env "${ENV_BACKEND}"
   --jobs-dir "${JOBS_DIR}"
   --n-concurrent "${N_CONCURRENT}"
@@ -714,12 +936,26 @@ CMD=(
   --job-name "${JOB_NAME}"
 )
 
+if [[ -n "${REGISTRY_URL}" ]]; then
+  CMD+=(--registry-url "${REGISTRY_URL}")
+fi
+
 if [[ "${AGENT}" == "lash" ]]; then
-  CMD+=(--agent-import-path scripts.harbor_lash_agent:LashAgent)
+  CMD+=(--agent scripts.harbor_lash_agent:LashAgent)
 elif [[ "${AGENT}" == "opencode" ]]; then
-  CMD+=(--agent-import-path scripts.harbor_opencode_agent:BenchOpenCodeAgent)
+  CMD+=(--agent scripts.harbor_opencode_agent:BenchOpenCodeAgent)
 elif [[ "${AGENT}" == "codex" ]]; then
-  CMD+=(--agent-import-path scripts.harbor_codex_agent:BenchCodexAgent)
+  CMD+=(--agent codex)
+fi
+
+CMD+=(--agent-include-logs "**/*")
+CMD+=(--verifier-include-logs "**/*")
+
+if [[ "${AGENT}" == "codex" ]]; then
+  CMD+=(--agent-kwarg "reasoning_effort=${VARIANT}")
+  if [[ -n "${CODEX_AGENT_VERSION}" ]]; then
+    CMD+=(--agent-kwarg "version=${CODEX_AGENT_VERSION}")
+  fi
 fi
 
 if [[ -n "${MODEL}" ]]; then
@@ -735,34 +971,55 @@ if [[ "${DEBUG}" -eq 1 ]]; then
 fi
 
 for pattern in "${TASK_PATTERNS[@]}"; do
-  CMD+=(--include-task-name "${pattern}")
+  CMD+=(--include-task-name "$(harbor_task_filter_name "${pattern}")")
 done
 
 for task_name in "${EXACT_TASKS[@]}"; do
-  CMD+=(--include-task-name "${task_name}")
+  CMD+=(--include-task-name "$(harbor_task_filter_name "${task_name}")")
 done
 
 for pattern in "${EXCLUDE_PATTERNS[@]}"; do
   CMD+=(--exclude-task-name "${pattern}")
 done
 
+for task_name in "${REUSE_EXCLUDE_TASKS[@]}"; do
+  CMD+=(--exclude-task-name "$(harbor_task_filter_name "${task_name}")")
+done
+
 if [[ ${#EXTRA_ARGS[@]} -gt 0 ]]; then
   CMD+=("${EXTRA_ARGS[@]}")
 fi
 
-echo "==> Running: ${CMD[*]}"
+if [[ "${SKIP_HARBOR}" -eq 1 ]]; then
+  echo "==> Harbor run will be skipped: all requested exact tasks are covered by reusable completed attempts."
+else
+  echo "==> Running: ${CMD[*]}"
+fi
 
 if [[ "${DRY_RUN}" -eq 1 ]]; then
   exit 0
 fi
 
 set +e
-"${CMD[@]}"
-HARBOR_RC=$?
+if [[ "${SKIP_HARBOR}" -eq 1 ]]; then
+  echo "==> Skipping Harbor run: all requested exact tasks are covered by reusable completed attempts."
+  mkdir -p "${JOBS_DIR}/${JOB_NAME}"
+  HARBOR_RC=0
+else
+  "${CMD[@]}"
+  HARBOR_RC=$?
+fi
 set -e
 
 JOB_DIR="${JOBS_DIR}/${JOB_NAME}"
 if [[ -d "${JOB_DIR}" ]]; then
+  if [[ "${REUSE_COMPLETED}" -eq 1 && -n "${REUSE_PLAN_PATH}" && -f "${REUSE_PLAN_PATH}" ]]; then
+    python3 "${SCRIPT_DIR}/terminalbench_reuse.py" \
+      merge \
+      --plan-path "${REUSE_PLAN_PATH}" \
+      --target-job-dir "${JOB_DIR}" || true
+  fi
+
   validate_exact_task_execution "${JOB_DIR}"
 
   EXPORT_CMD=(
@@ -773,12 +1030,14 @@ if [[ -d "${JOB_DIR}" ]]; then
     --dataset "${DATASET}"
     --execution-mode "${RUN_EXECUTION_MODE}"
     --harbor-env "${ENV_BACKEND}"
-    --registry-url "${REGISTRY_URL}"
     --n-concurrent "${N_CONCURRENT}"
     --attempts "${ATTEMPTS}"
     --timeout-multiplier "${TIMEOUT_MULT}"
   )
 
+  if [[ -n "${REGISTRY_URL}" ]]; then
+    EXPORT_CMD+=(--registry-url "${REGISTRY_URL}")
+  fi
   if [[ -n "${TASK_PRESET}" ]]; then
     EXPORT_CMD+=(--preset "${TASK_PRESET}")
   fi
@@ -793,6 +1052,9 @@ if [[ -d "${JOB_DIR}" ]]; then
   fi
   if [[ -n "${VARIANT}" ]]; then
     EXPORT_CMD+=(--variant "${VARIANT}")
+  fi
+  if [[ -n "${CODEX_AGENT_VERSION}" ]]; then
+    EXPORT_CMD+=(--agent-version "${CODEX_AGENT_VERSION}")
   fi
   if [[ -n "${CONTEXT_APPROACH}" ]]; then
     EXPORT_CMD+=(--context-approach "${CONTEXT_APPROACH}")
@@ -813,7 +1075,7 @@ if [[ -d "${JOB_DIR}" ]]; then
     EXPORT_CMD+=(--exclude-pattern "${pattern}")
   done
   for arg in "${EXTRA_ARGS[@]}"; do
-    EXPORT_CMD+=(--extra-arg "${arg}")
+    EXPORT_CMD+=("--extra-arg=${arg}")
   done
 
   "${EXPORT_CMD[@]}" || true

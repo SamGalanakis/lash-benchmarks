@@ -2,7 +2,7 @@
 
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, BTreeSet};
-use std::fs::{self, File};
+use std::fs::{self, File, OpenOptions};
 use std::io::Write;
 use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
@@ -16,22 +16,25 @@ use clap::{Parser, ValueEnum};
 use lash::persistence::RuntimePersistence;
 use lash::provider::ProviderHandle;
 use lash::rlm::{RlmFinalAnswerFormat, RlmSessionBuilderExt as _, RlmTurnBuilderExt as _};
-use lash::runtime::{TurnFinish, TurnOutcome, TurnStop};
 use lash::usage::{SessionUsageReport, TokenUsage};
 use lash::{
-    LashSession, ModelSpec, PluginStack, RlmCore, SessionSpec, StandardCore, TurnActivity,
-    TurnActivitySink, TurnEvent, TurnInput,
+    LashCore, LashSession, ModelSpec, PluginStack, TurnActivity, TurnActivitySink, TurnEvent,
+    TurnInput,
 };
+use lash::{TurnFinish, TurnOutcome, TurnStop};
+use lash_core::plugin::{PluginSpec, StaticPluginFactory};
 use lash_core::{
     DirectJsonSchema, DirectLlmClient, DirectRequest, GenerationOptions, LlmResponse,
-    SchemaContract, TestLocalProcessRegistry,
+    SchemaContract, TestLocalProcessRegistry, ToolProvider,
 };
-use lash_llm_tools::LlmToolsPluginFactory;
+use lash_plugin_observational_memory::ObservationalMemoryPluginFactory;
+use lash_search_tools::grep_provider;
 use lash_sqlite_store::Store;
+use lash_standard_plugins::locked_down_rlm_plugin_stack;
 use lash_standard_plugins::{
-    StandardContextApproach, StandardToolStackOptions, standard_tool_stack,
+    StandardContextApproach, rolling_history::RollingHistoryPluginFactory,
 };
-use lash_subagents::{CapabilityRegistry, StaticCapability, SubagentsPluginFactory};
+use lash_tools::files::{glob_provider, read_file_provider};
 use regex::Regex;
 use serde::{Deserialize, Serialize};
 use tokio::sync::Semaphore;
@@ -72,6 +75,10 @@ const WARDEN_MAX_GAP_LINES: usize = 30;
 const WARDEN_MAX_CHUNK_SIZE: usize = 8_000;
 const DEFAULT_POST_PROCESS_BATCH_SIZE: usize = 4;
 const DEFAULT_POST_PROCESS_MAX_OUTPUT_TOKENS: usize = 4096;
+const DEFAULT_SCORE_MAX_OUTPUT_TOKENS: usize = 1024;
+const AGENT_SEMANTIC_MATCH_PASS: &str = "agent-semantic-match-pass";
+const POST_PROCESSING_METHOD: &str =
+    "upstream_warden_sdk_chunk_dedupe_apply_merge_groups_lash_verify_merge_synthesis";
 const CHILD_CONTAINER_RUN_DIR: &str = "/work/run";
 const CHILD_CONTAINER_REPO_DIR: &str = "/work/repo";
 const CHILD_CONTAINER_LASH_HOME: &str = "/work/secrets/lash";
@@ -88,11 +95,10 @@ const SECURITY_REVIEW_PROMPT: &str = concat!(
     "Rules:\n",
     "1. Review only the Warden hunk named below. You may inspect nearby definitions, callers, permissions, models, and tests only when needed to understand reachability and impact.\n",
     "2. Report exploitable security or tenant-isolation vulnerabilities. Do not report style, refactors, missing tests, generic hardening, or speculative issues without a concrete attack path.\n",
-    "3. Do not edit files, commit, or run destructive commands.\n",
-    "4. Return a single JSON object and no surrounding prose. The shape is: {\"findings\":[{\"title\":\"...\",\"severity\":\"low|medium|high\",\"confidence\":\"low|medium|high\",\"path\":\"...\",\"start_line\":123,\"description\":\"...\",\"evidence\":\"...\",\"recommendation\":\"...\"}]}.\n",
-    "5. If you find no qualifying issue, return {\"findings\":[]}.\n",
-    "6. Every finding's `path` must be the target file and `start_line` must be inside the hunk line range. If the root cause is in surrounding code, anchor the finding to the nearest relevant line inside the hunk and explain the trace in `evidence`.\n",
-    "7. When file, glob, or shell tools are available, inspect the repository directly with those tools. Use glob before guessing adjacent paths. Do not spawn subagents just to read the target file.\n",
+    "3. Return a single JSON object and no surrounding prose. The shape is: {\"findings\":[{\"title\":\"...\",\"severity\":\"low|medium|high\",\"confidence\":\"low|medium|high\",\"path\":\"...\",\"start_line\":123,\"description\":\"...\",\"evidence\":\"...\",\"recommendation\":\"...\"}]}.\n",
+    "4. If you find no qualifying issue, return {\"findings\":[]}.\n",
+    "5. Every finding's `path` must be the target file and `start_line` must be inside the hunk line range. If the root cause is in surrounding code, anchor the finding to the nearest relevant line inside the hunk and explain the trace in `evidence`.\n",
+    "6. Inspect the repository directly with read_file, grep, and glob. Use glob before guessing adjacent paths.\n",
 );
 
 const WARDEN_FINDING_ID_ALPHABET: &[u8] = b"ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
@@ -198,20 +204,16 @@ struct Args {
     #[arg(long)]
     score_run_dir: Option<PathBuf>,
 
-    /// Maximum output tokens for each semantic-scoring judge call.
-    #[arg(long, default_value_t = 4096)]
-    score_max_output_tokens: usize,
-
-    /// Maximum number of semantic-scoring judge calls to run concurrently.
+    /// Maximum number of semantic-match calls to run concurrently.
     #[arg(long, default_value_t = 8)]
     score_batch_size: usize,
 
-    /// Continue writing score details when an individual judge call fails.
-    #[arg(long)]
-    score_allow_partial: bool,
+    /// Maximum output tokens for each semantic-match call.
+    #[arg(long, default_value_t = DEFAULT_SCORE_MAX_OUTPUT_TOKENS)]
+    score_max_output_tokens: usize,
 
-    /// Post-process an existing run with Warden-equivalent dedupe, verification,
-    /// merge, and finalized JSONL output.
+    /// Post-process an existing run with upstream Warden SDK deterministic
+    /// steps, Lash verification/synthesis, and finalized JSONL output.
     #[arg(long)]
     post_process_run_dir: Option<PathBuf>,
 
@@ -368,7 +370,8 @@ struct WardenChunk {
     context_after: Vec<String>,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 struct DiffHunk {
     old_start: usize,
     old_count: usize,
@@ -702,11 +705,6 @@ struct VerificationVerdict {
     reason: Option<String>,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
-struct MergeGroupsResponse {
-    groups: Vec<Vec<usize>>,
-}
-
 #[derive(Clone, Debug)]
 struct AuxiliaryUsageEntry {
     agent: String,
@@ -744,32 +742,12 @@ struct EmittedFinding {
     value: serde_json::Value,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct ScoringJudgeVerdict {
-    finding_index: usize,
-    verdict: String,
-    matched_corpus_ids: Vec<String>,
-    confidence: String,
-    notes: String,
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize)]
-struct ScoringJudgeResponse {
-    scores: Vec<ScoringJudgeVerdict>,
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 struct SemanticScoreRow {
-    task_id: String,
-    sha: String,
-    target_path: String,
-    finding_index: usize,
-    finding: serde_json::Value,
+    finding_id: String,
     verdict: String,
     matched_corpus_ids: Vec<String>,
-    confidence: String,
     notes: String,
 }
 
@@ -780,33 +758,86 @@ struct ScoringUsageTotals {
     output_tokens: u64,
     reasoning_tokens: u64,
     cache_read_input_tokens: u64,
+    cache_creation_input_tokens: u64,
+    cache_creation_5m_input_tokens: u64,
+    cache_creation_1h_input_tokens: u64,
+    web_search_requests: u64,
     provider_total_tokens: u64,
+    cost_usd: f64,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct AgentSemanticMatchResponse {
+    verdict: String,
+    matched_corpus_ids: Vec<String>,
+    notes: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 struct SemanticScoringResult {
     run_id: String,
     corpus_id: String,
     scoring: serde_json::Value,
-    judge: serde_json::Value,
     scores: Vec<SemanticScoreRow>,
-    errors: Vec<serde_json::Value>,
 }
 
 #[derive(Clone, Debug)]
-struct ScoringTaskJob {
+struct AgentScoringJob {
     index: usize,
-    result: TaskResult,
-    emitted: Vec<EmittedFinding>,
+    sha: String,
+    task_id: String,
+    target_path: String,
+    finding_index: usize,
+    finding_id: String,
+    finding: serde_json::Value,
     candidates: Vec<CorpusFinding>,
 }
 
-#[derive(Debug)]
-struct ScoringTaskOutput {
+#[derive(Debug, Serialize, Deserialize)]
+struct AgentScoringOutput {
     index: usize,
     scores: Vec<SemanticScoreRow>,
-    errors: Vec<serde_json::Value>,
     usage: ScoringUsageTotals,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct UpstreamDedupResponse {
+    kept_indices: Vec<usize>,
+    events: Vec<UpstreamFindingEventIndex>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct UpstreamFindingEventIndex {
+    stage: String,
+    action: String,
+    finding_index: usize,
+    replacement_index: Option<usize>,
+    reason: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct UpstreamApplyMergeGroupsResponse {
+    absorbed: Vec<UpstreamAbsorbedFinding>,
+    replacements: Vec<UpstreamFindingReplacement>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct UpstreamAbsorbedFinding {
+    index: usize,
+    replacement: Option<WardenFinding>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct UpstreamFindingReplacement {
+    index: usize,
+    finding: WardenFinding,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1470,7 +1501,7 @@ async fn post_process_existing_run(
         }
 
         let before_dedupe = shard_findings.len();
-        let (deduped, dedupe_events) = deduplicate_post_findings(shard_findings);
+        let (deduped, dedupe_events) = deduplicate_with_upstream_warden(shard_findings)?;
         counters.dedupe_dropped += before_dedupe.saturating_sub(deduped.len());
         events.extend(dedupe_events);
 
@@ -1606,7 +1637,7 @@ async fn post_process_existing_run(
         "cleanStateWarning": clean_state_warning,
         "model": resolved_model,
         "providerKind": provider_kind,
-        "method": "warden_equivalent_normalize_dedupe_repo_tool_verify_merge",
+        "method": POST_PROCESSING_METHOD,
     });
     fs::write(
         run_dir.join(POST_PROCESS_SUMMARY_ARTIFACT),
@@ -1970,7 +2001,7 @@ async fn run_repo_aware_verification_turn(
     .map_err(anyhow::Error::msg)?;
 
     let sink = Arc::new(InstanceEventSink::new(events_path.clone())?);
-    let mut builder = StandardCore::builder()
+    let mut builder = LashCore::standard_builder()
         .provider(provider)
         .model(model_spec)
         .max_turns(args.max_turns)
@@ -2089,11 +2120,14 @@ async fn merge_post_findings(
             });
             let groups = parse_merge_groups_response(&response.full_text).unwrap_or_default();
             artifact["groups"] = serde_json::json!(groups);
-            let original_groups =
-                map_merge_groups_to_original_one_based_indices(&groups, &located_original_indices);
-            artifact["groupsOriginalOneBasedIndices"] = serde_json::json!(original_groups);
-            let (merged, events, absorbed) =
-                apply_merge_groups_to_post_findings(findings, &original_groups);
+            let (merged, events, absorbed, upstream_apply) =
+                apply_merge_groups_with_upstream_warden(
+                    findings,
+                    &located_original_indices,
+                    &groups,
+                )
+                .with_context(|| "apply upstream Warden merge groups")?;
+            artifact["upstreamApplyMergeGroups"] = upstream_apply;
             fs::write(artifact_path, serde_json::to_string_pretty(&artifact)?)
                 .with_context(|| format!("write {}", artifact_path.display()))?;
             Ok(MergeOutput {
@@ -2319,45 +2353,44 @@ fn warden_finding_id_from_seed(seed: &str) -> String {
     format!("{}-{}", &raw[..3], &raw[3..])
 }
 
-fn deduplicate_post_findings(
+fn deduplicate_with_upstream_warden(
     findings: Vec<PostProcessFinding>,
-) -> (Vec<PostProcessFinding>, Vec<FindingProcessingEventJson>) {
-    let mut seen: BTreeMap<String, WardenFinding> = BTreeMap::new();
-    let mut kept = Vec::new();
-    let mut events = Vec::new();
-    for finding in findings {
-        let key = dedupe_key(&finding.finding);
-        if let Some(replacement) = seen.get(&key) {
-            events.push(FindingProcessingEventJson {
-                stage: "dedupe".to_string(),
-                action: "dropped".to_string(),
-                finding: finding.finding,
-                reason: Some("duplicate title and location".to_string()),
-                replacement: Some(replacement.clone()),
-            });
-        } else {
-            seen.insert(key, finding.finding.clone());
-            kept.push(finding);
-        }
+) -> Result<(Vec<PostProcessFinding>, Vec<FindingProcessingEventJson>)> {
+    let output = run_upstream_warden_bridge(serde_json::json!({
+        "mode": "deduplicateFindings",
+        "findings": findings.iter().map(|finding| &finding.finding).collect::<Vec<_>>(),
+    }))
+    .with_context(|| "run upstream Warden deduplicateFindings")?;
+    let response: UpstreamDedupResponse =
+        serde_json::from_value(output).with_context(|| "parse upstream Warden dedupe response")?;
+    let mut kept = Vec::with_capacity(response.kept_indices.len());
+    for index in response.kept_indices {
+        let finding = findings.get(index).cloned().ok_or_else(|| {
+            anyhow::anyhow!("upstream Warden dedupe returned invalid kept index {index}")
+        })?;
+        kept.push(finding);
     }
-    (kept, events)
-}
-
-fn dedupe_key(finding: &WardenFinding) -> String {
-    format!(
-        "{}:{}:{}",
-        finding.title,
-        finding
-            .location
-            .as_ref()
-            .map(|loc| loc.path.as_str())
-            .unwrap_or(""),
-        finding
-            .location
-            .as_ref()
-            .map(|loc| loc.start_line.to_string())
-            .unwrap_or_default()
-    )
+    let mut events = Vec::new();
+    for event in response.events {
+        let finding = findings.get(event.finding_index).ok_or_else(|| {
+            anyhow::anyhow!(
+                "upstream Warden dedupe returned invalid event finding index {}",
+                event.finding_index
+            )
+        })?;
+        let replacement = event
+            .replacement_index
+            .and_then(|index| findings.get(index))
+            .map(|finding| finding.finding.clone());
+        events.push(FindingProcessingEventJson {
+            stage: event.stage,
+            action: event.action,
+            finding: finding.finding.clone(),
+            reason: event.reason,
+            replacement,
+        });
+    }
+    Ok((kept, events))
 }
 
 fn build_verification_prompt(finding: &WardenFinding) -> Result<String> {
@@ -2368,7 +2401,7 @@ fn build_verification_prompt(finding: &WardenFinding) -> Result<String> {
             "Your job is to deeply trace the code, look for mitigations and intent, then keep, revise, or reject the candidate.\n",
             "</role>\n\n",
             "<tools>\n",
-            "Use read-only repository tools to inspect the checkout. Read the reported file and use glob, read_file, and shell commands such as rg/git grep to trace callers, imports, wrappers, guards, validators, and related code. Do not edit files.\n",
+            "Use read-only repository tools to inspect the checkout. Read the reported file and use grep/glob to trace callers, imports, wrappers, guards, validators, and related code.\n",
             "</tools>\n\n",
             "<repository>\n",
             "The current working directory is the Sentry checkout being verified. Candidate location paths are relative to this checkout.\n",
@@ -2517,41 +2550,38 @@ fn build_merge_prompt(findings: &[PostProcessFinding], repo_dir: &Path) -> Resul
         let loc = finding.finding.location.as_ref();
         let snippet = loc
             .map(|loc| read_repo_snippet(repo_dir, &loc.path, loc.start_line, 3))
-            .transpose()?
             .unwrap_or_default();
-        indexed.push(format!(
-            concat!(
-                "{}. [{}] {} ({})\n",
-                "Location: {}\n",
-                "Description: {}\n",
-                "Evidence: {}\n",
-                "Snippet:\n```text\n{}\n```"
-            ),
+        let location = loc
+            .map(format_merge_location)
+            .unwrap_or_else(|| "general".to_string());
+        let mut text = format!(
+            "{}. [{}] \"{}\" - {}",
             index + 1,
-            finding.finding.severity,
+            location,
             finding.finding.title,
-            finding.finding.confidence.as_deref().unwrap_or("low"),
-            loc.map(format_location)
-                .unwrap_or_else(|| "unknown".to_string()),
-            finding.finding.description,
-            finding.finding.verification.as_deref().unwrap_or(""),
-            snippet
-        ));
+            finding.finding.description
+        );
+        if !snippet.is_empty() {
+            text.push_str("\n   Code: ");
+            text.push_str(&snippet.split('\n').collect::<Vec<_>>().join("\n   "));
+        }
+        indexed.push(text);
     }
     Ok(format!(
         concat!(
             "<task>\n",
-            "Identify code review findings that describe the SAME underlying issue appearing at different locations. Group them by shared root cause.\n",
+            "Identify which of these code review findings describe the SAME underlying issue appearing at different locations. Group them by shared root cause.\n",
             "</task>\n\n",
             "<findings>\n",
             "{}\n",
             "</findings>\n\n",
-            "<json_output>\n",
-            "Return exactly {{\"groups\":[[1,2]]}} where each inner array contains 1-based indices of findings about the same issue. ",
-            "Do not include singletons. Return {{\"groups\":[]}} when none share a root cause.\n",
-            "</json_output>"
+            "<output_format>\n",
+            "Return only valid JSON. Do not include markdown, prose, code fences, or explanations.\n\n",
+            "Return a JSON array of arrays, where each inner array contains the 1-based indices of findings about the same issue.\n",
+            "Singletons should not appear. Return [] if no findings describe the same issue.\n",
+            "</output_format>"
         ),
-        indexed.join("\n\n")
+        indexed.join("\n")
     ))
 }
 
@@ -2564,217 +2594,104 @@ fn build_merge_request(args: &Args, model: &str, prompt: String) -> DirectReques
     let mut request = DirectRequest::json_schema(model.to_string(), prompt, schema);
     request.model_variant = args.variant.clone();
     request.generation = GenerationOptions {
-        output_token_cap: NonZeroUsize::new(args.post_process_max_output_tokens.min(1024)),
+        output_token_cap: NonZeroUsize::new(args.post_process_max_output_tokens.min(512)),
     };
     request
 }
 
 fn merge_groups_response_schema() -> serde_json::Value {
     serde_json::json!({
-        "type": "object",
-        "additionalProperties": false,
-        "required": ["groups"],
-        "properties": {
-            "groups": {
-                "type": "array",
-                "items": {
-                    "type": "array",
-                    "items": { "type": "integer", "minimum": 1 }
-                }
-            }
+        "type": "array",
+        "items": {
+            "type": "array",
+            "items": { "type": "integer", "minimum": 1 }
         }
     })
 }
 
 fn parse_merge_groups_response(text: &str) -> Option<Vec<Vec<usize>>> {
-    serde_json::from_str::<MergeGroupsResponse>(text.trim())
+    serde_json::from_str::<Vec<Vec<usize>>>(text.trim())
         .ok()
-        .map(|response| response.groups)
-        .or_else(|| {
-            parse_assistant_json(text)
-                .and_then(|value| serde_json::from_value::<MergeGroupsResponse>(value).ok())
-                .map(|response| response.groups)
-        })
+        .or_else(|| parse_assistant_json(text).and_then(|value| serde_json::from_value(value).ok()))
 }
 
-fn map_merge_groups_to_original_one_based_indices(
-    groups: &[Vec<usize>],
-    indexed_original_indices: &[usize],
-) -> Vec<Vec<usize>> {
-    groups
-        .iter()
-        .map(|group| {
-            group
-                .iter()
-                .filter_map(|raw_index| {
-                    if *raw_index == 0 {
-                        return None;
-                    }
-                    indexed_original_indices
-                        .get(raw_index - 1)
-                        .map(|original_index| original_index + 1)
-                })
-                .collect::<Vec<_>>()
-        })
-        .collect()
-}
-
-fn apply_merge_groups_to_post_findings(
+fn apply_merge_groups_with_upstream_warden(
     findings: Vec<PostProcessFinding>,
+    located_original_indices: &[usize],
     groups: &[Vec<usize>],
-) -> (
+) -> Result<(
     Vec<PostProcessFinding>,
     Vec<FindingProcessingEventJson>,
     usize,
-) {
-    let mut absorbed: BTreeSet<usize> = BTreeSet::new();
-    let mut replacements: BTreeMap<usize, PostProcessFinding> = BTreeMap::new();
+    serde_json::Value,
+)> {
+    let located_findings = located_original_indices
+        .iter()
+        .map(|index| &findings[*index].finding)
+        .collect::<Vec<_>>();
+    let output = run_upstream_warden_bridge(serde_json::json!({
+        "mode": "applyMergeGroups",
+        "findings": located_findings,
+        "groups": groups,
+    }))
+    .with_context(|| "run upstream Warden applyMergeGroups")?;
+    let response: UpstreamApplyMergeGroupsResponse = serde_json::from_value(output.clone())
+        .with_context(|| "parse upstream Warden applyMergeGroups response")?;
 
-    for group in groups {
-        let mut unique_indices = BTreeSet::new();
-        for raw_index in group {
-            if *raw_index == 0 {
-                continue;
-            }
-            let index = raw_index - 1;
-            if index < findings.len() {
-                unique_indices.insert(index);
-            }
-        }
-        let group_indices = unique_indices
-            .into_iter()
-            .filter(|index| !absorbed.contains(index))
-            .collect::<Vec<_>>();
-        if group_indices.len() < 2 {
-            continue;
-        }
-
-        let mut sorted = group_indices.clone();
-        sorted.sort_by(|a, b| {
-            compare_warden_finding_priority(&findings[*a].finding, &findings[*b].finding)
-        });
-        let winner_index = sorted[0];
-        let sorted_findings = sorted
-            .iter()
-            .map(|index| {
-                replacements
-                    .get(index)
-                    .cloned()
-                    .unwrap_or_else(|| findings[*index].clone())
-            })
-            .collect::<Vec<_>>();
-        if let Some(merged) = merge_group_locations(&sorted_findings) {
-            replacements.insert(winner_index, merged);
-        }
-        for index in group_indices {
-            if index != winner_index {
-                absorbed.insert(index);
-            }
-        }
-    }
-
+    let mut absorbed_original_indices = BTreeSet::new();
     let mut events = Vec::new();
-    for index in &absorbed {
-        let finding = &findings[*index];
+    for absorbed in response.absorbed {
+        let original_index = *located_original_indices
+            .get(absorbed.index)
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "upstream Warden applyMergeGroups returned invalid absorbed index {}",
+                    absorbed.index
+                )
+            })?;
+        absorbed_original_indices.insert(original_index);
         events.push(FindingProcessingEventJson {
             stage: "merge".to_string(),
             action: "merged".to_string(),
-            finding: finding.finding.clone(),
+            finding: findings[original_index].finding.clone(),
             reason: Some("same root cause at another location".to_string()),
-            replacement: find_replacement_for_absorbed(finding, &replacements),
+            replacement: absorbed.replacement,
         });
     }
 
+    let mut replacements = BTreeMap::new();
+    for replacement in response.replacements {
+        let original_index = *located_original_indices
+            .get(replacement.index)
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "upstream Warden applyMergeGroups returned invalid replacement index {}",
+                    replacement.index
+                )
+            })?;
+        replacements.insert(original_index, replacement.finding);
+    }
+
+    let absorbed_count = absorbed_original_indices.len();
     let merged = findings
         .into_iter()
         .enumerate()
         .filter_map(|(index, finding)| {
-            if absorbed.contains(&index) {
+            if absorbed_original_indices.contains(&index) {
                 None
             } else {
-                Some(replacements.remove(&index).unwrap_or(finding))
+                let finding = replacements
+                    .remove(&index)
+                    .map(|replacement| PostProcessFinding {
+                        finding: replacement,
+                        origin: finding.origin.clone(),
+                    })
+                    .unwrap_or(finding);
+                Some(finding)
             }
         })
         .collect::<Vec<_>>();
-    (merged, events, absorbed.len())
-}
-
-fn merge_group_locations(group: &[PostProcessFinding]) -> Option<PostProcessFinding> {
-    let winner = group.first()?.clone();
-    let losers = &group[1..];
-    if losers.is_empty() {
-        return Some(winner);
-    }
-
-    let mut extra_locations = winner
-        .finding
-        .additional_locations
-        .clone()
-        .unwrap_or_default();
-    for loser in losers {
-        if let Some(location) = loser.finding.location.clone() {
-            extra_locations.push(location);
-        }
-        if let Some(locations) = loser.finding.additional_locations.clone() {
-            extra_locations.extend(locations);
-        }
-    }
-    if extra_locations.is_empty() {
-        return Some(winner);
-    }
-
-    let mut seen = BTreeSet::new();
-    if let Some(location) = &winner.finding.location {
-        seen.insert(location_key(location));
-    }
-    let unique = extra_locations
-        .into_iter()
-        .filter(|location| seen.insert(location_key(location)))
-        .collect::<Vec<_>>();
-    let mut merged = winner;
-    merged.finding.additional_locations = Some(unique);
-    Some(merged)
-}
-
-fn find_replacement_for_absorbed(
-    absorbed: &PostProcessFinding,
-    replacements: &BTreeMap<usize, PostProcessFinding>,
-) -> Option<WardenFinding> {
-    let absorbed_location = absorbed.finding.location.as_ref()?;
-    replacements.values().find_map(|replacement| {
-        replacement
-            .finding
-            .additional_locations
-            .as_ref()
-            .and_then(|locations| {
-                locations
-                    .iter()
-                    .any(|location| location_key(location) == location_key(absorbed_location))
-                    .then(|| replacement.finding.clone())
-            })
-    })
-}
-
-fn compare_warden_finding_priority(a: &WardenFinding, b: &WardenFinding) -> Ordering {
-    severity_order(&a.severity)
-        .cmp(&severity_order(&b.severity))
-        .then(
-            confidence_order(a.confidence.as_deref())
-                .cmp(&confidence_order(b.confidence.as_deref())),
-        )
-        .then(
-            a.location
-                .as_ref()
-                .map(|loc| loc.path.as_str())
-                .unwrap_or("")
-                .cmp(
-                    b.location
-                        .as_ref()
-                        .map(|loc| loc.path.as_str())
-                        .unwrap_or(""),
-                ),
-        )
-        .then(finding_line(a).cmp(&finding_line(b)))
+    Ok((merged, events, absorbed_count, output))
 }
 
 fn compare_post_finding_for_output(a: &PostProcessFinding, b: &PostProcessFinding) -> Ordering {
@@ -2786,24 +2703,6 @@ fn compare_post_finding_for_output(a: &PostProcessFinding, b: &PostProcessFindin
         .then(a.origin.finding_index.cmp(&b.origin.finding_index))
 }
 
-fn severity_order(severity: &str) -> u8 {
-    match severity {
-        "high" => 0,
-        "medium" => 1,
-        "low" => 2,
-        _ => 3,
-    }
-}
-
-fn confidence_order(confidence: Option<&str>) -> u8 {
-    match confidence.unwrap_or("low") {
-        "high" => 0,
-        "medium" => 1,
-        "low" => 2,
-        _ => 3,
-    }
-}
-
 fn finding_line(finding: &WardenFinding) -> u64 {
     finding
         .location
@@ -2812,18 +2711,7 @@ fn finding_line(finding: &WardenFinding) -> u64 {
         .unwrap_or(0)
 }
 
-fn location_key(location: &WardenLocation) -> String {
-    format!(
-        "{}:{}:{}",
-        location.path,
-        location.start_line,
-        location
-            .end_line
-            .map(|line| line.to_string())
-            .unwrap_or_default()
-    )
-}
-
+#[cfg(test)]
 fn format_location(location: &WardenLocation) -> String {
     match location.end_line {
         Some(end_line) if end_line != location.start_line => {
@@ -2833,32 +2721,43 @@ fn format_location(location: &WardenLocation) -> String {
     }
 }
 
+fn format_merge_location(location: &WardenLocation) -> String {
+    match location.end_line {
+        Some(end_line) => format!("{}:{}-{}", location.path, location.start_line, end_line),
+        None => format!("{}:{}", location.path, finding_line_from_location(location)),
+    }
+}
+
+fn finding_line_from_location(location: &WardenLocation) -> u64 {
+    location.end_line.unwrap_or(location.start_line)
+}
+
 fn read_repo_snippet(
     repo_dir: &Path,
     file_path: &str,
     start_line: u64,
     context_lines: usize,
-) -> Result<String> {
+) -> String {
     let full_path = repo_dir.join(file_path);
-    let content = fs::read_to_string(&full_path)
-        .with_context(|| format!("read snippet source {}", full_path.display()))?;
-    let lines = content.lines().collect::<Vec<_>>();
+    let Ok(content) = fs::read_to_string(&full_path) else {
+        return String::new();
+    };
+    let lines = content.split('\n').collect::<Vec<_>>();
     let start = start_line
         .saturating_sub(1)
         .saturating_sub(context_lines as u64) as usize;
     let end = (start_line as usize + context_lines).min(lines.len());
-    let mut out = Vec::new();
-    for (offset, line) in lines[start..end].iter().enumerate() {
-        out.push(format!("{:>5}: {}", start + offset + 1, line));
+    if start >= end {
+        return String::new();
     }
-    Ok(out.join("\n"))
+    lines[start..end].join("\n")
 }
 
 fn usage_stats_from_response(args: &Args, response: &LlmResponse) -> WardenUsageStats {
     let input = response.usage.input_tokens.max(0) as u64;
     let output = response.usage.output_tokens.max(0) as u64;
-    let cache_read = response.usage.cached_input_tokens.max(0) as u64;
-    let reasoning = response.usage.reasoning_tokens.max(0) as u64;
+    let cache_read = response.usage.cache_read_input_tokens.max(0) as u64;
+    let reasoning = response.usage.reasoning_output_tokens.max(0) as u64;
     let tokens = TokenTotals {
         input,
         output,
@@ -3570,6 +3469,10 @@ const packageRoot = path.join(refRoot, 'packages/warden');
 const srcRoot = path.join(packageRoot, 'src');
 const localTsx = path.join(refRoot, 'node_modules/.bin/tsx');
 const nodeModules = path.join(refRoot, 'node_modules');
+const wardenDist = path.join(packageRoot, 'dist/index.js');
+const wardenDiffCoalesce = path.join(packageRoot, 'dist/diff/coalesce.js');
+const wardenDiffParser = path.join(packageRoot, 'dist/diff/parser.js');
+const wardenSdkExtract = path.join(packageRoot, 'dist/sdk/extract.js');
 const result = {
   checkedAt: new Date().toISOString(),
   refRoot,
@@ -3579,6 +3482,10 @@ const result = {
   packageJsonExists: fs.existsSync(path.join(packageRoot, 'package.json')),
   nodeModulesExists: fs.existsSync(nodeModules),
   localTsxExists: fs.existsSync(localTsx),
+  wardenDistExists: fs.existsSync(wardenDist),
+  wardenDiffCoalesceExists: fs.existsSync(wardenDiffCoalesce),
+  wardenDiffParserExists: fs.existsSync(wardenDiffParser),
+  wardenSdkExtractExists: fs.existsSync(wardenSdkExtract),
   canExecuteTypeScript: false,
   blocker: null,
 };
@@ -3588,6 +3495,10 @@ if (!result.srcExists || !result.packageJsonExists) {
   result.blocker = 'missing /tmp/ref-warden/node_modules; refusing package-manager install in Rust harness tests';
 } else if (!result.localTsxExists) {
   result.blocker = 'missing local tsx binary in /tmp/ref-warden/node_modules/.bin/tsx';
+} else if (!result.wardenDistExists) {
+  result.blocker = 'missing built upstream Warden dist at /tmp/ref-warden/packages/warden/dist/index.js';
+} else if (!result.wardenDiffCoalesceExists || !result.wardenDiffParserExists || !result.wardenSdkExtractExists) {
+  result.blocker = 'missing required upstream Warden dist modules for chunking/post-processing bridge';
 } else {
   result.canExecuteTypeScript = true;
 }
@@ -3608,6 +3519,10 @@ fn upstream_bridge_probe_direct() -> serde_json::Value {
     let src_root = package_root.join("src");
     let node_modules = ref_root.join("node_modules");
     let local_tsx = node_modules.join(".bin/tsx");
+    let warden_dist = package_root.join("dist/index.js");
+    let warden_diff_coalesce = package_root.join("dist/diff/coalesce.js");
+    let warden_diff_parser = package_root.join("dist/diff/parser.js");
+    let warden_sdk_extract = package_root.join("dist/sdk/extract.js");
     let blocker = if command_path("node").is_none() {
         "missing node executable"
     } else if !src_root.exists() || !package_root.join("package.json").exists() {
@@ -3616,6 +3531,13 @@ fn upstream_bridge_probe_direct() -> serde_json::Value {
         "missing /tmp/ref-warden/node_modules; refusing package-manager install in Rust harness tests"
     } else if !local_tsx.exists() {
         "missing local tsx binary in /tmp/ref-warden/node_modules/.bin/tsx"
+    } else if !warden_dist.exists() {
+        "missing built upstream Warden dist at /tmp/ref-warden/packages/warden/dist/index.js"
+    } else if !warden_diff_coalesce.exists()
+        || !warden_diff_parser.exists()
+        || !warden_sdk_extract.exists()
+    {
+        "missing required upstream Warden dist modules for chunking/post-processing bridge"
     } else {
         ""
     };
@@ -3628,9 +3550,158 @@ fn upstream_bridge_probe_direct() -> serde_json::Value {
         "packageJsonExists": package_root.join("package.json").exists(),
         "nodeModulesExists": node_modules.exists(),
         "localTsxExists": local_tsx.exists(),
+        "wardenDistExists": warden_dist.exists(),
+        "wardenDiffCoalesceExists": warden_diff_coalesce.exists(),
+        "wardenDiffParserExists": warden_diff_parser.exists(),
+        "wardenSdkExtractExists": warden_sdk_extract.exists(),
         "canExecuteTypeScript": blocker.is_empty(),
         "blocker": if blocker.is_empty() { serde_json::Value::Null } else { serde_json::Value::String(blocker.to_string()) },
     })
+}
+
+fn run_upstream_warden_bridge(request: serde_json::Value) -> Result<serde_json::Value> {
+    let probe = upstream_bridge_probe_direct();
+    if probe
+        .get("canExecuteTypeScript")
+        .and_then(|value| value.as_bool())
+        != Some(true)
+    {
+        bail!(
+            "upstream Warden bridge is unavailable: {}",
+            probe
+                .get("blocker")
+                .and_then(|value| value.as_str())
+                .unwrap_or("unknown blocker")
+        );
+    }
+    let node = command_path("node").ok_or_else(|| anyhow::anyhow!("missing node executable"))?;
+    let script_path = std::env::temp_dir().join(format!(
+        "warden-sentry-upstream-bridge-{}-{}.mjs",
+        std::process::id(),
+        Utc::now().timestamp_nanos_opt().unwrap_or_default()
+    ));
+    fs::write(&script_path, upstream_warden_bridge_script())
+        .with_context(|| format!("write {}", script_path.display()))?;
+    let mut child = Command::new(node)
+        .arg(&script_path)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .with_context(|| "spawn upstream Warden bridge")?;
+    {
+        let stdin = child
+            .stdin
+            .as_mut()
+            .ok_or_else(|| anyhow::anyhow!("open upstream Warden bridge stdin"))?;
+        stdin
+            .write_all(serde_json::to_string(&request)?.as_bytes())
+            .with_context(|| "write upstream Warden bridge request")?;
+    }
+    let output = child
+        .wait_with_output()
+        .with_context(|| "wait for upstream Warden bridge")?;
+    let _ = fs::remove_file(&script_path);
+    if !output.status.success() {
+        bail!(
+            "upstream Warden bridge failed with {}: {}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+    serde_json::from_slice(&output.stdout).with_context(|| "parse upstream Warden bridge output")
+}
+
+fn upstream_warden_bridge_script() -> &'static str {
+    r#"
+import fs from 'node:fs';
+import { parsePatch } from '/tmp/ref-warden/packages/warden/dist/diff/parser.js';
+import { splitLargeHunks, coalesceHunks } from '/tmp/ref-warden/packages/warden/dist/diff/coalesce.js';
+import { deduplicateFindings, applyMergeGroups } from '/tmp/ref-warden/packages/warden/dist/sdk/extract.js';
+
+function createPatchFromContent(content) {
+  const lines = content.split('\n');
+  const lineCount = lines.length;
+  if (lineCount === 0 || (lineCount === 1 && lines[0] === '')) {
+    return '@@ -0,0 +0,0 @@\n';
+  }
+  return [`@@ -0,0 +1,${lineCount} @@`, ...lines.map((line) => `+${line}`)].join('\n');
+}
+
+function attachIndex(finding, index) {
+  Object.defineProperty(finding, '__wardenBenchIndex', {
+    value: index,
+    enumerable: false,
+    configurable: false,
+  });
+  return finding;
+}
+
+function stripHidden(value) {
+  if (value === undefined) {
+    return undefined;
+  }
+  return JSON.parse(JSON.stringify(value));
+}
+
+function sameLocation(a, b) {
+  return Boolean(a && b && `${a.path}:${a.startLine}:${a.endLine ?? ''}` === `${b.path}:${b.startLine}:${b.endLine ?? ''}`);
+}
+
+function replacementForAbsorbed(finding, replacements) {
+  for (const replacement of replacements.values()) {
+    if (replacement.additionalLocations?.some((loc) => sameLocation(loc, finding.location))) {
+      return replacement;
+    }
+  }
+  return undefined;
+}
+
+const input = JSON.parse(fs.readFileSync(0, 'utf8'));
+
+if (input.mode === 'chunkFile') {
+  const hunks = parsePatch(createPatchFromContent(input.content));
+  const split = splitLargeHunks(hunks, { maxChunkSize: input.maxChunkSize });
+  const coalesced = coalesceHunks(split, {
+    maxGapLines: input.maxGapLines,
+    maxChunkSize: input.maxChunkSize,
+  });
+  console.log(JSON.stringify({ hunks: coalesced }));
+} else if (input.mode === 'deduplicateFindings') {
+  const findings = input.findings.map((finding, index) => attachIndex({ ...finding }, index));
+  const events = [];
+  const kept = deduplicateFindings(findings, (event) => {
+    events.push({
+      stage: event.stage,
+      action: event.action,
+      findingIndex: event.finding?.__wardenBenchIndex,
+      replacementIndex: event.replacement?.__wardenBenchIndex,
+      reason: event.reason,
+    });
+  });
+  console.log(JSON.stringify({
+    keptIndices: kept.map((finding) => finding.__wardenBenchIndex),
+    events,
+  }));
+} else if (input.mode === 'applyMergeGroups') {
+  const findings = input.findings.map((finding, index) => attachIndex({ ...finding }, index));
+  const { absorbed, replacements } = applyMergeGroups(findings, input.groups);
+  console.log(JSON.stringify({
+    absorbed: findings
+      .filter((finding) => absorbed.has(finding))
+      .map((finding) => ({
+        index: finding.__wardenBenchIndex,
+        replacement: stripHidden(replacementForAbsorbed(finding, replacements)),
+      })),
+    replacements: [...replacements.entries()].map(([finding, replacement]) => ({
+      index: finding.__wardenBenchIndex,
+      finding: stripHidden(replacement),
+    })),
+  }));
+} else {
+  throw new Error(`unknown upstream Warden bridge mode: ${input.mode}`);
+}
+"#
 }
 
 fn command_path(program: &str) -> Option<String> {
@@ -3727,7 +3798,7 @@ fn write_reproducibility_manifest(
         "benchmark": BENCHMARK_NAME,
         "repository": DEFAULT_REPOSITORY,
         "targetMode": TARGET_MODE,
-        "postProcessingMethod": "warden_equivalent_normalize_dedupe_repo_tool_verify_merge",
+        "postProcessingMethod": POST_PROCESSING_METHOD,
         "runner": {
             "gitSha": git_stdout(None, &["rev-parse", "HEAD"]),
             "gitDirty": git_dirty,
@@ -3762,7 +3833,7 @@ fn write_reproducibility_manifest(
             "findingsResponseSchemaSha256": sha256_hex_json(&findings_response_schema()),
             "verificationResponseSchemaSha256": sha256_hex_json(&verification_response_schema()),
             "mergeGroupsResponseSchemaSha256": sha256_hex_json(&merge_groups_response_schema()),
-            "scoringResponseSchemaSha256": sha256_hex_json(&scoring_response_schema()),
+            "agentSemanticMatchResponseSchemaSha256": sha256_hex_json(&agent_semantic_match_schema()),
         },
         "docker": {
             "image": docker_image,
@@ -4139,21 +4210,24 @@ fn validate_finalized_run(run_dir: &Path) -> Result<serde_json::Value> {
     {
         failures.push("summary.json wardenComparable is not true".to_string());
     }
-    if summary
-        .get("scoring")
-        .and_then(|value| value.get("inputArtifact"))
-        .and_then(|value| value.as_str())
-        != Some(WARDEN_FINAL_JSONL_ARTIFACT)
-    {
-        failures.push("summary.json scoring.inputArtifact is not warden-final.jsonl".to_string());
-    }
-    if summary
-        .get("scoring")
-        .and_then(|value| value.get("wardenComparable"))
-        .and_then(|value| value.as_bool())
-        != Some(true)
-    {
-        failures.push("summary.json scoring.wardenComparable is not true".to_string());
+    if !run_dir.join(SEMANTIC_SCORING_ARTIFACT).exists() {
+        if summary
+            .get("scoring")
+            .and_then(|value| value.get("inputArtifact"))
+            .and_then(|value| value.as_str())
+            != Some(WARDEN_FINAL_JSONL_ARTIFACT)
+        {
+            failures
+                .push("summary.json scoring.inputArtifact is not warden-final.jsonl".to_string());
+        }
+        if summary
+            .get("scoring")
+            .and_then(|value| value.get("wardenComparableRequired"))
+            .and_then(|value| value.as_bool())
+            != Some(true)
+        {
+            failures.push("summary.json scoring.wardenComparableRequired is not true".to_string());
+        }
     }
 
     validate_renamed_stale_scores(run_dir, &summary, &post_summary, &mut failures)?;
@@ -4360,25 +4434,12 @@ fn validate_semantic_scoring_artifact(
     let scoring = read_json_file(&path)?;
     let artifact_scoring = scoring.get("scoring").unwrap_or(&serde_json::Value::Null);
     let summary_scoring = summary.get("scoring").unwrap_or(&serde_json::Value::Null);
-    if json_str(artifact_scoring, &["inputArtifact"]) != Some(WARDEN_FINAL_JSONL_ARTIFACT) {
+    if json_str(artifact_scoring, &["reviewer"]) != Some(AGENT_SEMANTIC_MATCH_PASS) {
         failures.push(
-            "semantic-scoring.json scoring.inputArtifact is not warden-final.jsonl".to_string(),
+            "semantic-scoring.json scoring.reviewer is not agent-semantic-match-pass".to_string(),
         );
     }
-    if artifact_scoring
-        .get("wardenComparable")
-        .and_then(|value| value.as_bool())
-        != Some(true)
-    {
-        failures.push("semantic-scoring.json scoring.wardenComparable is not true".to_string());
-    }
-    for key in [
-        "status",
-        "inputState",
-        "inputArtifact",
-        "reviewer",
-        "method",
-    ] {
+    for key in ["reviewer", "scoredAt", "notes"] {
         if artifact_scoring.get(key) != summary_scoring.get(key) {
             failures.push(format!(
                 "semantic-scoring.json scoring.{key} does not match summary.json"
@@ -4387,12 +4448,9 @@ fn validate_semantic_scoring_artifact(
     }
     for key in [
         "knownFound",
-        "knownTotal",
         "knownFindingCount",
         "knownMissed",
-        "knownFoundEntries",
-        "notKnownEntries",
-        "emittedFindings",
+        "knownPartial",
     ] {
         if json_usize(artifact_scoring, &[key]) != json_usize(summary_scoring, &[key]) {
             failures.push(format!(
@@ -4400,7 +4458,7 @@ fn validate_semantic_scoring_artifact(
             ));
         }
     }
-    for key in ["recall", "knownFoundRate", "precision"] {
+    for key in ["knownFoundRate"] {
         let a = json_f64(artifact_scoring, &[key]);
         let b = json_f64(summary_scoring, &[key]);
         if a.zip(b).map(|(a, b)| (a - b).abs() <= 0.000001) != Some(true) {
@@ -4409,16 +4467,16 @@ fn validate_semantic_scoring_artifact(
             ));
         }
     }
-    if json_usize(artifact_scoring, &["emittedFindings"]) != Some(final_findings) {
+    if scoring
+        .get("scores")
+        .and_then(|value| value.as_array())
+        .map(Vec::len)
+        != Some(final_findings)
+    {
         failures.push(
-            "semantic-scoring.json emittedFindings does not equal finalized finding count"
+            "semantic-scoring.json scores length does not equal finalized finding count"
                 .to_string(),
         );
-    }
-    if json_f64(artifact_scoring, &["judge", "cost", "usd"])
-        != json_f64(summary_scoring, &["judge", "cost", "usd"])
-    {
-        failures.push("semantic-scoring.json judge cost does not match summary.json".to_string());
     }
     Ok(())
 }
@@ -4510,7 +4568,7 @@ fn update_summary_post_processing(
         serde_json::json!({
             "enabled": true,
             "status": post_summary.get("status").cloned().unwrap_or_else(|| serde_json::json!("completed")),
-            "method": "warden_equivalent_repo_aware_tool_pass",
+            "method": "lash_repo_aware_tool_pass",
             "artifact": POST_PROCESS_SUMMARY_ARTIFACT,
             "eventsArtifact": POST_PROCESS_EVENTS_ARTIFACT,
             "artifacts": "post-processing/verification/",
@@ -4787,30 +4845,32 @@ async fn run_score(args: Args) -> Result<()> {
     let corpus_by_sha = corpus_by_sha(&corpus);
     let corpus_id_to_sha = corpus_id_to_short_sha(&corpus);
     let run_id = run_id_from_summary_or_dir(&run_dir)?;
-    let (_provider, provider_kind, resolved_model) = resolve_provider(&args)?;
+    let (_provider, _provider_kind, resolved_model) = resolve_provider(&args)?;
     let score_batch_size = args.score_batch_size.max(1);
+    let all_jobs = build_agent_scoring_jobs(&results, &corpus_by_sha);
+    let jobs_total = all_jobs.len();
+    let progress_artifact = semantic_scoring_progress_artifact();
+    let progress_path = run_dir.join(&progress_artifact);
+    let completed_outputs = load_scoring_progress(&progress_path)?;
+    let completed_indexes = completed_outputs.keys().copied().collect::<BTreeSet<_>>();
+    let mut outputs = completed_outputs.into_values().collect::<Vec<_>>();
+    let resumed_jobs = outputs.len();
+    let jobs = all_jobs
+        .into_iter()
+        .filter(|job| !completed_indexes.contains(&job.index))
+        .collect::<Vec<_>>();
     eprintln!(
-        "Semantic scoring run_id={run_id} tasks={} score_batch_size={score_batch_size}",
-        results.len()
+        "Semantic scoring run_id={run_id} tasks={} emitted_findings={jobs_total} resumed={} remaining={} score_batch_size={score_batch_size} reviewer={}",
+        results.len(),
+        resumed_jobs,
+        jobs.len(),
+        AGENT_SEMANTIC_MATCH_PASS
     );
 
     let semaphore = Arc::new(Semaphore::new(score_batch_size));
-    let mut join_set: JoinSet<Result<ScoringTaskOutput>> = JoinSet::new();
-    let mut judged_tasks = 0usize;
+    let mut join_set: JoinSet<Result<AgentScoringOutput>> = JoinSet::new();
 
-    for (index, result) in results.iter().cloned().enumerate() {
-        let emitted = emitted_findings(&result);
-        if emitted.is_empty() {
-            continue;
-        }
-        judged_tasks += 1;
-        let candidates = corpus_by_sha.get(&result.sha).cloned().unwrap_or_default();
-        let job = ScoringTaskJob {
-            index,
-            result,
-            emitted,
-            candidates,
-        };
+    for job in jobs {
         let permit = semaphore
             .clone()
             .acquire_owned()
@@ -4820,32 +4880,24 @@ async fn run_score(args: Args) -> Result<()> {
         let job_model = resolved_model.clone();
         join_set.spawn(async move {
             let _permit = permit;
-            score_one_task(job_args, job_model, job).await
+            score_one_agent_semantic_match(job_args, job_model, job).await
         });
+        while join_set.len() >= score_batch_size {
+            collect_next_scoring_output(&mut join_set, &mut outputs, jobs_total, &progress_path)
+                .await?;
+        }
     }
 
-    let mut outputs = Vec::new();
-    while let Some(joined) = join_set.join_next().await {
-        match joined {
-            Ok(Ok(output)) => outputs.push(output),
-            Ok(Err(err)) => {
-                join_set.abort_all();
-                bail!("{err:#}");
-            }
-            Err(err) => {
-                join_set.abort_all();
-                bail!("semantic scoring task panicked: {err}");
-            }
-        }
+    while !join_set.is_empty() {
+        collect_next_scoring_output(&mut join_set, &mut outputs, jobs_total, &progress_path)
+            .await?;
     }
     outputs.sort_by_key(|output| output.index);
 
     let mut scores = Vec::new();
-    let mut errors = Vec::new();
     let mut usage = ScoringUsageTotals::default();
     for output in outputs {
         merge_scoring_usage(&mut usage, &output.usage);
-        errors.extend(output.errors);
         scores.extend(output.scores);
     }
 
@@ -4854,64 +4906,30 @@ async fn run_score(args: Args) -> Result<()> {
         .flat_map(|row| row.matched_corpus_ids.iter().cloned())
         .filter(|id| selected_corpus_ids.contains(id))
         .collect::<BTreeSet<_>>();
-    let known_found_entries = scores
-        .iter()
-        .filter(|row| row.verdict == "known-found" && !row.matched_corpus_ids.is_empty())
-        .count();
-    let not_known_entries = scores.len().saturating_sub(known_found_entries);
     let known_total = selected_corpus_ids.len();
     let known_found = matched_ids.len();
     let known_missed = known_total.saturating_sub(known_found);
     let known_found_rate = ratio4(known_found, known_total);
-    let precision = ratio4(known_found_entries, scores.len());
     let missed_ids = selected_corpus_ids
         .iter()
         .filter(|id| !matched_ids.contains(*id))
         .cloned()
         .collect::<Vec<_>>();
-    let judge_cost = estimate_scoring_cost(&args, &usage);
-    let judge = serde_json::json!({
-        "providerKind": provider_kind,
-        "model": resolved_model,
-        "variant": args.variant,
-        "tasksJudged": judged_tasks,
-        "batchSize": score_batch_size,
-        "usage": usage,
-        "cost": judge_cost,
-    });
-
     let scoring = serde_json::json!({
-        "status": if errors.is_empty() { "scored" } else { "partial" },
-        "reviewer": "lash-direct-llm-semantic-match",
+        "reviewer": AGENT_SEMANTIC_MATCH_PASS,
         "scoredAt": Utc::now().date_naive().to_string(),
-        "method": "direct_llm_semantic_match",
-        "inputState": "finalized",
-        "inputArtifact": WARDEN_FINAL_JSONL_ARTIFACT,
-        "wardenComparable": true,
-        "wardenComparableRequired": true,
-        "knownTotal": known_total,
         "knownFindingCount": known_total,
         "knownFound": known_found,
         "knownMissed": known_missed,
         "knownPartial": 0,
         "knownFoundRate": known_found_rate,
-        "recall": known_found_rate,
-        "precision": precision,
-        "emittedFindings": scores.len(),
-        "knownFoundEntries": known_found_entries,
-        "notKnownEntries": not_known_entries,
-        "scoresArtifact": SEMANTIC_SCORING_ARTIFACT,
-        "summaryArtifact": SEMANTIC_SCORING_SUMMARY_ARTIFACT,
-        "judge": judge.clone(),
-        "notes": "LLM-reviewed semantic match against Warden's Sentry Vulnerability Corpus. A finding counts only when it identifies the same bug in roughly the same location as a corpus finding. Same-file different bugs are scored not-known. Duplicate emitted findings matching the same corpus id do not double-count knownFound."
+        "notes": "Agent-verified semantic matches. A finding counts when it identifies the same bug in roughly the same location as an existing corpus finding. Same-file findings about different bugs do not count."
     });
     let artifact = SemanticScoringResult {
         run_id: run_id.clone(),
         corpus_id: corpus.id.clone(),
         scoring: scoring.clone(),
-        judge,
         scores: scores.clone(),
-        errors,
     };
 
     let artifact_path = run_dir.join(SEMANTIC_SCORING_ARTIFACT);
@@ -4934,80 +4952,182 @@ async fn run_score(args: Args) -> Result<()> {
         known_found_rate * 100.0
     );
     eprintln!("  emitted_scored:   {}", scores.len());
+    eprintln!(
+        "  score_tokens:     input={} output={} reasoning={} cache_read={}",
+        usage.input_tokens,
+        usage.output_tokens,
+        usage.reasoning_tokens,
+        usage.cache_read_input_tokens
+    );
+    eprintln!("  progress:         {}", progress_path.display());
     Ok(())
 }
 
-async fn score_one_task(
+async fn collect_next_scoring_output(
+    join_set: &mut JoinSet<Result<AgentScoringOutput>>,
+    outputs: &mut Vec<AgentScoringOutput>,
+    total: usize,
+    progress_path: &Path,
+) -> Result<()> {
+    let Some(joined) = join_set.join_next().await else {
+        return Ok(());
+    };
+    match joined {
+        Ok(Ok(output)) => {
+            append_scoring_progress(progress_path, &output)?;
+            outputs.push(output);
+            eprintln!(
+                "Semantic scoring progress: {}/{} match jobs completed",
+                outputs.len(),
+                total
+            );
+            Ok(())
+        }
+        Ok(Err(err)) => {
+            join_set.abort_all();
+            bail!("{err:#}");
+        }
+        Err(err) => {
+            join_set.abort_all();
+            bail!("semantic scoring task panicked: {err}");
+        }
+    }
+}
+
+fn semantic_scoring_progress_artifact() -> String {
+    format!("semantic-scoring.{AGENT_SEMANTIC_MATCH_PASS}.progress.jsonl")
+}
+
+fn load_scoring_progress(path: &Path) -> Result<BTreeMap<usize, AgentScoringOutput>> {
+    if !path.exists() {
+        return Ok(BTreeMap::new());
+    }
+    let raw = fs::read_to_string(path).with_context(|| format!("read {}", path.display()))?;
+    let mut outputs = BTreeMap::new();
+    for (line_index, line) in raw.lines().enumerate() {
+        if line.trim().is_empty() {
+            continue;
+        }
+        let output = serde_json::from_str::<AgentScoringOutput>(line).with_context(|| {
+            format!(
+                "parse {} line {} as scoring progress",
+                path.display(),
+                line_index + 1
+            )
+        })?;
+        outputs.insert(output.index, output);
+    }
+    Ok(outputs)
+}
+
+fn append_scoring_progress(path: &Path, output: &AgentScoringOutput) -> Result<()> {
+    let mut file = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+        .with_context(|| format!("open {}", path.display()))?;
+    writeln!(file, "{}", serde_json::to_string(output)?)
+        .with_context(|| format!("append {}", path.display()))?;
+    file.flush()
+        .with_context(|| format!("flush {}", path.display()))?;
+    Ok(())
+}
+
+async fn score_one_agent_semantic_match(
     args: Args,
     resolved_model: String,
-    job: ScoringTaskJob,
-) -> Result<ScoringTaskOutput> {
-    let mut usage = ScoringUsageTotals::default();
-    let prompt = build_scoring_prompt(&job.result, &job.emitted, &job.candidates)?;
-    let request = build_scoring_request(&args, &resolved_model, prompt);
+    job: AgentScoringJob,
+) -> Result<AgentScoringOutput> {
+    let prompt = build_agent_semantic_match_prompt(&job)?;
+    let request = build_agent_semantic_match_request(&args, &resolved_model, prompt);
     let (provider, _, _) = resolve_provider(&args)?;
     let mut client = DirectLlmClient::new(provider);
-    let response = match client.complete(request).await {
-        Ok(response) => response,
-        Err(err) => {
-            let error = serde_json::json!({
-                "taskId": job.result.task_id,
-                "targetPath": job.result.target_path,
-                "error": err.to_string(),
-            });
-            if args.score_allow_partial {
-                return Ok(ScoringTaskOutput {
-                    index: job.index,
-                    scores: Vec::new(),
-                    errors: vec![error],
-                    usage,
-                });
-            }
-            bail!("semantic scoring failed for {}: {err}", job.result.task_id);
-        }
-    };
+    let response = client
+        .complete(request)
+        .await
+        .with_context(|| format!("agent semantic match failed for {}", job.finding_id))?;
+
+    let mut usage = ScoringUsageTotals::default();
     add_scoring_usage(&mut usage, &response);
+    let match_response: AgentSemanticMatchResponse =
+        serde_json::from_str(response.full_text.trim()).with_context(|| {
+            format!("parse agent semantic match response for {}", job.finding_id)
+        })?;
+    let score = score_row_from_agent_match(&job, match_response)?;
 
-    let judge_response: ScoringJudgeResponse = match serde_json::from_str(response.full_text.trim())
-    {
-        Ok(parsed) => parsed,
-        Err(err) => {
-            let error = serde_json::json!({
-                "taskId": job.result.task_id,
-                "targetPath": job.result.target_path,
-                "error": format!("parse judge JSON: {err}"),
-                "raw": response.full_text,
-            });
-            if args.score_allow_partial {
-                return Ok(ScoringTaskOutput {
-                    index: job.index,
-                    scores: Vec::new(),
-                    errors: vec![error],
-                    usage,
-                });
-            }
-            bail!(
-                "semantic scoring parse failed for {}: {err}",
-                job.result.task_id
-            );
-        }
-    };
-
-    let scores = score_rows_from_judge(
-        &job.result,
-        &job.emitted,
-        &job.candidates,
-        judge_response,
-        args.score_allow_partial,
-    )
-    .with_context(|| format!("normalize score rows for {}", job.result.task_id))?;
-
-    Ok(ScoringTaskOutput {
+    Ok(AgentScoringOutput {
         index: job.index,
-        scores,
-        errors: Vec::new(),
+        scores: vec![score],
         usage,
     })
+}
+
+fn score_row_from_agent_match(
+    job: &AgentScoringJob,
+    match_response: AgentSemanticMatchResponse,
+) -> Result<SemanticScoreRow> {
+    let candidate_ids = candidate_subset_for_job(job)
+        .into_iter()
+        .map(|finding| finding.id.as_str())
+        .collect::<BTreeSet<_>>();
+    let mut invalid_ids = Vec::new();
+    let mut matched_corpus_ids = BTreeSet::new();
+    for id in match_response.matched_corpus_ids {
+        if candidate_ids.contains(id.as_str()) {
+            matched_corpus_ids.insert(id);
+        } else {
+            invalid_ids.push(id);
+        }
+    }
+    if !invalid_ids.is_empty() {
+        bail!(
+            "agent semantic match for {} returned ids outside presented candidates: {}",
+            job.finding_id,
+            invalid_ids.join(", ")
+        );
+    }
+    let matched_corpus_ids = matched_corpus_ids.into_iter().collect::<Vec<_>>();
+    let verdict = normalize_agent_match_verdict(&match_response.verdict, &matched_corpus_ids);
+    if match_response
+        .verdict
+        .trim()
+        .eq_ignore_ascii_case("known-found")
+        && matched_corpus_ids.is_empty()
+    {
+        bail!(
+            "agent semantic match marked {} known-found without matchedCorpusIds",
+            job.finding_id
+        );
+    }
+    if verdict == "not-known" && !matched_corpus_ids.is_empty() {
+        bail!(
+            "agent semantic match marked {} not-known but returned matchedCorpusIds",
+            job.finding_id
+        );
+    }
+    Ok(SemanticScoreRow {
+        finding_id: job.finding_id.clone(),
+        verdict,
+        matched_corpus_ids,
+        notes: truncate_str(&match_response.notes, 500),
+    })
+}
+
+fn normalize_agent_match_verdict(raw: &str, matched_corpus_ids: &[String]) -> String {
+    let raw = raw.trim().to_ascii_lowercase().replace('_', "-");
+    if raw == "known-found" && !matched_corpus_ids.is_empty() {
+        "known-found".to_string()
+    } else {
+        "not-known".to_string()
+    }
+}
+
+fn add_scoring_usage(totals: &mut ScoringUsageTotals, response: &LlmResponse) {
+    totals.input_tokens += response.usage.input_tokens.max(0) as u64;
+    totals.output_tokens += response.usage.output_tokens.max(0) as u64;
+    totals.reasoning_tokens += response.usage.reasoning_output_tokens.max(0) as u64;
+    totals.cache_read_input_tokens += response.usage.cache_read_input_tokens.max(0) as u64;
+    totals.provider_total_tokens = totals.input_tokens + totals.output_tokens;
 }
 
 async fn run_child(args: Args) -> Result<()> {
@@ -5568,7 +5688,7 @@ async fn run_task(ctx: RunTaskContext<'_>, task: &WardenTask) -> Result<TaskResu
     let turn_started = Instant::now();
     let telemetry = match execution_mode {
         ExecutionMode::Standard => {
-            let mut builder = StandardCore::builder()
+            let mut builder = LashCore::standard_builder()
                 .provider(provider.clone())
                 .model(model_spec)
                 .max_turns(args.max_turns)
@@ -5601,28 +5721,28 @@ async fn run_task(ctx: RunTaskContext<'_>, task: &WardenTask) -> Result<TaskResu
             .await?
         }
         ExecutionMode::Rlm => {
-            let mut builder = RlmCore::builder()
-                .provider(provider.clone())
-                .model(model_spec)
-                .max_turns(args.max_turns)
-                .store_factory(Arc::new(
-                    lash::persistence::InMemorySessionStoreFactory::new(),
-                ))
-                .process_registry(Arc::new(TestLocalProcessRegistry::default()))
-                .process_env_store(Arc::new(
-                    lash::persistence::InMemoryProcessExecutionEnvStore::new(),
-                ))
-                .plugins(build_rlm_plugin_stack())
-                .effect_host(Arc::new(lash::durability::InlineEffectHost::default()))
-                .lashlang_artifact_store(Arc::new(
-                    lash::persistence::InMemoryLashlangArtifactStore::new(),
-                ))
-                .attachment_store(Arc::new(lash::persistence::InMemoryAttachmentStore::new()));
+            let mut builder = LashCore::rlm_builder(lash::rlm::RlmProtocolPluginFactory::new(
+                lash::rlm::RlmProtocolPluginConfig::default(),
+                Arc::new(lash::persistence::InMemoryLashlangArtifactStore::new()),
+            ))
+            .provider(provider.clone())
+            .model(model_spec)
+            .max_turns(args.max_turns)
+            .store_factory(Arc::new(
+                lash::persistence::InMemorySessionStoreFactory::new(),
+            ))
+            .process_registry(Arc::new(TestLocalProcessRegistry::default()))
+            .process_env_store(Arc::new(
+                lash::persistence::InMemoryProcessExecutionEnvStore::new(),
+            ))
+            .plugins(build_rlm_plugin_stack())
+            .effect_host(Arc::new(lash::durability::InlineEffectHost::default()))
+            .attachment_store(Arc::new(lash::persistence::InMemoryAttachmentStore::new()));
             builder = builder.trace_jsonl_path(trace_path.clone());
             let core = builder.build()?;
             let session = core
                 .session("root")
-                .final_answer_format(RlmFinalAnswerFormat::RawFinalValue)
+                .final_answer_format(RlmFinalAnswerFormat::RawFinalValue)?
                 .store(store.clone() as Arc<dyn RuntimePersistence>)
                 .open()
                 .await?;
@@ -6009,8 +6129,21 @@ fn format_hunk_for_analysis(task: &WardenTask) -> String {
 
 fn build_warden_chunks(filename: &str, content: &str) -> Result<Vec<WardenChunk>> {
     let file_lines = content.split('\n').map(str::to_string).collect::<Vec<_>>();
-    let patch = create_patch_from_content(content);
-    let hunks = parse_patch(&patch)?;
+    let output = run_upstream_warden_bridge(serde_json::json!({
+        "mode": "chunkFile",
+        "filename": filename,
+        "content": content,
+        "maxGapLines": WARDEN_MAX_GAP_LINES,
+        "maxChunkSize": WARDEN_MAX_CHUNK_SIZE,
+    }))
+    .with_context(|| format!("run upstream Warden chunk bridge for {filename}"))?;
+    let hunks = serde_json::from_value::<Vec<DiffHunk>>(
+        output
+            .get("hunks")
+            .cloned()
+            .ok_or_else(|| anyhow::anyhow!("upstream Warden chunk bridge omitted hunks"))?,
+    )
+    .with_context(|| format!("parse upstream Warden hunks for {filename}"))?;
     if hunks.is_empty()
         || hunks
             .iter()
@@ -6018,310 +6151,11 @@ fn build_warden_chunks(filename: &str, content: &str) -> Result<Vec<WardenChunk>
     {
         bail!("{filename} produced no analyzable Warden hunks");
     }
-    let split = split_large_hunks(hunks, WARDEN_MAX_CHUNK_SIZE);
-    let coalesced = coalesce_hunks(split, WARDEN_MAX_GAP_LINES, WARDEN_MAX_CHUNK_SIZE);
-    Ok(coalesced
+    Ok(hunks
         .into_iter()
         .enumerate()
         .map(|(index, hunk)| expand_hunk_context(filename, &file_lines, hunk, index + 1))
         .collect())
-}
-
-fn create_patch_from_content(content: &str) -> String {
-    let lines = content.split('\n').collect::<Vec<_>>();
-    let line_count = lines.len();
-    if line_count == 0 || (line_count == 1 && lines[0].is_empty()) {
-        return "@@ -0,0 +0,0 @@\n".to_string();
-    }
-    let mut patch_lines = Vec::with_capacity(line_count + 1);
-    patch_lines.push(format!("@@ -0,0 +1,{line_count} @@"));
-    for line in lines {
-        patch_lines.push(format!("+{line}"));
-    }
-    patch_lines.join("\n")
-}
-
-fn parse_patch(patch: &str) -> Result<Vec<DiffHunk>> {
-    let mut hunks = Vec::new();
-    let mut current: Option<DiffHunkBuilder> = None;
-    for line in patch.split('\n') {
-        if let Some(header) = parse_hunk_header(line)? {
-            if let Some(builder) = current.take() {
-                hunks.push(builder.finish());
-            }
-            current = Some(DiffHunkBuilder {
-                old_start: header.old_start,
-                old_count: header.old_count,
-                new_start: header.new_start,
-                new_count: header.new_count,
-                header: header.header,
-                content_parts: vec![line.to_string()],
-                lines: Vec::new(),
-            });
-        } else if let Some(builder) = current.as_mut()
-            && !line.starts_with("diff --git")
-            && !line.starts_with("index ")
-            && !line.starts_with("--- ")
-            && !line.starts_with("+++ ")
-            && !line.starts_with("\\ No newline")
-        {
-            builder.content_parts.push(line.to_string());
-            builder.lines.push(line.to_string());
-        }
-    }
-    if let Some(builder) = current {
-        hunks.push(builder.finish());
-    }
-    Ok(hunks)
-}
-
-#[derive(Clone, Debug)]
-struct DiffHunkHeader {
-    old_start: usize,
-    old_count: usize,
-    new_start: usize,
-    new_count: usize,
-    header: Option<String>,
-}
-
-struct DiffHunkBuilder {
-    old_start: usize,
-    old_count: usize,
-    new_start: usize,
-    new_count: usize,
-    header: Option<String>,
-    content_parts: Vec<String>,
-    lines: Vec<String>,
-}
-
-impl DiffHunkBuilder {
-    fn finish(self) -> DiffHunk {
-        DiffHunk {
-            old_start: self.old_start,
-            old_count: self.old_count,
-            new_start: self.new_start,
-            new_count: self.new_count,
-            header: self.header,
-            content: self.content_parts.join("\n"),
-            lines: self.lines,
-        }
-    }
-}
-
-fn parse_hunk_header(line: &str) -> Result<Option<DiffHunkHeader>> {
-    static HUNK_HEADER_RE: LazyLock<Regex> =
-        LazyLock::new(|| Regex::new(r"^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@(.*)$").unwrap());
-    let Some(captures) = HUNK_HEADER_RE.captures(line) else {
-        return Ok(None);
-    };
-    let old_start = captures[1].parse::<usize>()?;
-    let old_count = captures
-        .get(2)
-        .map(|m| m.as_str())
-        .unwrap_or("1")
-        .parse::<usize>()?;
-    let new_start = captures[3].parse::<usize>()?;
-    let new_count = captures
-        .get(4)
-        .map(|m| m.as_str())
-        .unwrap_or("1")
-        .parse::<usize>()?;
-    let header = captures
-        .get(5)
-        .map(|m| m.as_str().trim().to_string())
-        .filter(|s| !s.is_empty());
-    Ok(Some(DiffHunkHeader {
-        old_start,
-        old_count,
-        new_start,
-        new_count,
-        header,
-    }))
-}
-
-fn split_large_hunks(hunks: Vec<DiffHunk>, max_chunk_size: usize) -> Vec<DiffHunk> {
-    hunks
-        .into_iter()
-        .flat_map(|hunk| split_hunk(hunk, max_chunk_size))
-        .collect()
-}
-
-fn split_hunk(hunk: DiffHunk, max_chunk_size: usize) -> Vec<DiffHunk> {
-    if js_string_len(&hunk.content) <= max_chunk_size {
-        return vec![hunk];
-    }
-    let mut result = Vec::new();
-    let mut current_start = 0usize;
-    while current_start < hunk.lines.len() {
-        let avg_line_length = js_string_len(&hunk.content) as f64 / hunk.lines.len().max(1) as f64;
-        let estimated_lines = (max_chunk_size as f64 / avg_line_length).floor() as usize;
-        let target_end = (current_start + estimated_lines).min(hunk.lines.len());
-        let remaining_lines = &hunk.lines[current_start..];
-        let remaining_size = js_string_len(&remaining_lines.join("\n"));
-        if remaining_size <= max_chunk_size {
-            result.push(create_sub_hunk(&hunk, remaining_lines, current_start));
-            break;
-        }
-        let mut split_idx =
-            find_best_split_point(&hunk.lines, current_start, hunk.lines.len(), target_end);
-        if split_idx <= current_start {
-            split_idx = current_start + 1;
-        }
-        result.push(create_sub_hunk(
-            &hunk,
-            &hunk.lines[current_start..split_idx],
-            current_start,
-        ));
-        current_start = split_idx;
-    }
-    result
-}
-
-fn find_best_split_point(
-    lines: &[String],
-    start_idx: usize,
-    end_idx: usize,
-    target_idx: usize,
-) -> usize {
-    let window_size =
-        10usize.max((end_idx.saturating_sub(start_idx) as f64 * 0.2).floor() as usize);
-    let search_start = (start_idx + 1).max(target_idx.saturating_sub(window_size));
-    let search_end = (end_idx.saturating_sub(1)).min(target_idx + window_size);
-    let mut best_idx = target_idx;
-    let mut best_priority = usize::MAX;
-    for i in search_start..=search_end {
-        let Some(line) = lines.get(i) else {
-            continue;
-        };
-        if let Some(priority) = breakpoint_priority(line)
-            && priority < best_priority
-        {
-            best_priority = priority;
-            best_idx = i;
-        }
-    }
-    best_idx
-}
-
-fn breakpoint_priority(line: &str) -> Option<usize> {
-    static BREAKPOINT_PATTERNS: LazyLock<Vec<Regex>> = LazyLock::new(|| {
-        [
-            r"^[ ]?$",
-            r"^[ ]?(export\s+)?(async\s+)?function\s+\w+",
-            r"^[ ]?(export\s+)?(const|let|var)\s+\w+\s*=\s*(async\s+)?\(",
-            r"^[ ]?(export\s+)?(const|let|var)\s+\w+\s*=\s*(async\s+)?function",
-            r"^[ ]?(public|private|protected)?\s*(static\s+)?(async\s+)?\w+\s*\([^)]*\)\s*[:{]",
-            r"^[ ]?def\s+\w+",
-            r"^[ ]?fn\s+\w+",
-            r"^[ ]?func\s+\w+",
-            r"^[ ]?(export\s+)?(abstract\s+)?class\s+\w+",
-            r"^[ ]?(export\s+)?interface\s+\w+",
-            r"^[ ]?(export\s+)?type\s+\w+\s*=",
-            r"^[ ]?struct\s+\w+",
-            r"^[ ]?impl\s+",
-            r"^[ ]?/\*\*",
-            r"^[ ]?//",
-            r"^[ ]?#\s",
-        ]
-        .into_iter()
-        .map(|pattern| Regex::new(pattern).unwrap())
-        .collect()
-    });
-    BREAKPOINT_PATTERNS
-        .iter()
-        .position(|pattern| pattern.is_match(line))
-}
-
-fn create_sub_hunk(original: &DiffHunk, lines: &[String], line_offset: usize) -> DiffHunk {
-    let mut new_lines_before_offset = 0usize;
-    let mut old_lines_before_offset = 0usize;
-    for line in original.lines.iter().take(line_offset) {
-        if !line.starts_with('-') {
-            new_lines_before_offset += 1;
-        }
-        if !line.starts_with('+') {
-            old_lines_before_offset += 1;
-        }
-    }
-    let new_count = lines.iter().filter(|line| !line.starts_with('-')).count();
-    let old_count = lines.iter().filter(|line| !line.starts_with('+')).count();
-    let new_start = original.new_start + new_lines_before_offset;
-    let old_start = original.old_start + old_lines_before_offset;
-    let header_suffix = original
-        .header
-        .as_ref()
-        .map(|header| format!(" {header}"))
-        .unwrap_or_default();
-    let hunk_header =
-        format!("@@ -{old_start},{old_count} +{new_start},{new_count} @@{header_suffix}");
-    let mut content_parts = Vec::with_capacity(lines.len() + 1);
-    content_parts.push(hunk_header);
-    content_parts.extend(lines.iter().cloned());
-    DiffHunk {
-        old_start,
-        old_count,
-        new_start,
-        new_count,
-        header: original.header.clone(),
-        content: content_parts.join("\n"),
-        lines: lines.to_vec(),
-    }
-}
-
-fn coalesce_hunks(
-    mut hunks: Vec<DiffHunk>,
-    max_gap_lines: usize,
-    max_chunk_size: usize,
-) -> Vec<DiffHunk> {
-    if hunks.len() <= 1 {
-        return hunks;
-    }
-    hunks.sort_by_key(|hunk| hunk.new_start);
-    let mut iter = hunks.into_iter();
-    let mut current = iter.next().expect("hunks is not empty");
-    let mut result = Vec::new();
-    for next in iter {
-        let gap = next
-            .new_start
-            .saturating_sub(current.new_start + current.new_count);
-        let combined_size = js_string_len(&current.content) + js_string_len(&next.content);
-        if gap <= max_gap_lines && combined_size <= max_chunk_size {
-            current = merge_hunks(current, next);
-        } else {
-            result.push(current);
-            current = next;
-        }
-    }
-    result.push(current);
-    result
-}
-
-fn merge_hunks(a: DiffHunk, b: DiffHunk) -> DiffHunk {
-    let new_start = a.new_start.min(b.new_start);
-    let new_end = (a.new_start + a.new_count).max(b.new_start + b.new_count);
-    let old_start = a.old_start.min(b.old_start);
-    let old_end = (a.old_start + a.old_count).max(b.old_start + b.old_count);
-    let header = match (&a.header, &b.header) {
-        (Some(a_header), Some(b_header)) if a_header != b_header => {
-            Some(format!("{a_header} -> {b_header}"))
-        }
-        _ => a.header.clone().or_else(|| b.header.clone()),
-    };
-    let mut lines = a.lines;
-    lines.extend(b.lines);
-    DiffHunk {
-        old_start,
-        old_count: old_end - old_start,
-        new_start,
-        new_count: new_end - new_start,
-        header,
-        content: format!("{}\n...\n{}", a.content, b.content),
-        lines,
-    }
-}
-
-fn js_string_len(value: &str) -> usize {
-    value.encode_utf16().count()
 }
 
 fn expand_hunk_context(
@@ -6524,6 +6358,39 @@ fn emitted_findings(result: &TaskResult) -> Vec<EmittedFinding> {
         .collect()
 }
 
+fn build_agent_scoring_jobs(
+    results: &[TaskResult],
+    corpus_by_sha: &BTreeMap<String, Vec<CorpusFinding>>,
+) -> Vec<AgentScoringJob> {
+    let mut jobs = Vec::new();
+    for result in results {
+        let candidates = corpus_by_sha.get(&result.sha).cloned().unwrap_or_default();
+        for finding in emitted_findings(result) {
+            let finding_id = finding_id_from_value(&finding.value)
+                .unwrap_or_else(|| format!("{}#{}", result.task_id, finding.index + 1));
+            jobs.push(AgentScoringJob {
+                index: jobs.len(),
+                sha: result.sha.clone(),
+                task_id: result.task_id.clone(),
+                target_path: result.target_path.clone(),
+                finding_index: finding.index,
+                finding_id,
+                finding: finding.value,
+                candidates: candidates.clone(),
+            });
+        }
+    }
+    jobs
+}
+
+fn finding_id_from_value(value: &serde_json::Value) -> Option<String> {
+    value
+        .get("id")
+        .and_then(|value| value.as_str())
+        .filter(|value| !value.trim().is_empty())
+        .map(str::to_string)
+}
+
 fn apply_finalized_findings_to_results(
     results: &mut [TaskResult],
     jsonl_path: &Path,
@@ -6586,67 +6453,48 @@ fn apply_finalized_findings_to_results(
     Ok(())
 }
 
-fn build_scoring_prompt(
-    result: &TaskResult,
-    emitted: &[EmittedFinding],
-    candidates: &[CorpusFinding],
-) -> Result<String> {
-    let candidate_values = candidates
-        .iter()
-        .map(|finding| {
-            serde_json::json!({
-                "id": finding.id,
-                "path": finding.code.path,
-                "lines": finding.code.lines,
-                "language": finding.code.language,
-                "summary": finding.summary,
-                "snippet": finding.code.snippet.as_deref().map(|s| truncate_str(s, 1_200)),
-            })
-        })
+fn build_agent_semantic_match_prompt(job: &AgentScoringJob) -> Result<String> {
+    let candidates = candidate_subset_for_job(job)
+        .into_iter()
+        .map(agent_corpus_candidate_value)
         .collect::<Vec<_>>();
-    let emitted_values = emitted
-        .iter()
-        .map(|finding| {
-            serde_json::json!({
-                "findingIndex": finding.index,
-                "finding": finding.value,
-            })
-        })
-        .collect::<Vec<_>>();
-
+    let candidates_json = serde_json::to_string_pretty(&candidates)?;
+    let finding_json = serde_json::to_string_pretty(&job.finding)?;
     Ok(format!(
         concat!(
-            "You are scoring a security-review benchmark against Warden's Sentry Vulnerability Corpus.\n\n",
-            "Scoring rules:\n",
-            "- Return one score entry for every emitted finding.\n",
-            "- Mark `known-found` only when the emitted finding identifies the same bug in roughly the same code location as one or more corpus candidates.\n",
-            "- Same file but different bug is `not-known`.\n",
-            "- Duplicate emitted findings can each be `known-found`, but matched corpus IDs are deduplicated later for knownFound.\n",
-            "- Prefer candidates in the same target file; only use another same-commit candidate if it is clearly the same root cause.\n",
-            "- Use `matchedCorpusIds: []` for `not-known`.\n",
-            "- Keep notes to one short sentence.\n\n",
-            "Task:\n",
-            "taskId: {task_id}\n",
-            "sha: {sha}\n",
-            "targetPath: {target_path}\n\n",
-            "Corpus candidates for this commit:\n",
+            "You are performing Warden's Sentry vulnerability corpus agent-semantic-match-pass.\n",
+            "This is the same semantic scoring rule used in the published corpus benchmark results.\n\n",
+            "Score one finalized emitted finding against existing corpus findings from the same commit.\n\n",
+            "Rules:\n",
+            "- Return known-found only if the emitted finding identifies the same vulnerability/root cause in roughly the same code location as one or more corpus candidates.\n",
+            "- Same file but a different bug is not-known.\n",
+            "- A broad finding may match multiple corpus ids only when it explicitly covers the shared root cause or explicit additional locations.\n",
+            "- Ignore severity/confidence differences unless they prove the finding is about a different issue.\n",
+            "- Do not award credit for generic hardening, style issues, or speculative risks.\n",
+            "- matchedCorpusIds must contain only ids from the provided candidates.\n\n",
+            "Commit SHA: {sha}\n",
+            "Finding id: {finding_id}\n",
+            "Finding origin: task={task_id}, path={target_path}, findingIndex={finding_index}\n\n",
+            "Finalized emitted finding:\n",
+            "{finding_json}\n\n",
+            "Candidate corpus findings:\n",
             "{candidates_json}\n\n",
-            "Emitted findings to score:\n",
-            "{emitted_json}\n\n",
-            "Return only JSON matching the requested schema."
+            "Return only JSON with: verdict, matchedCorpusIds, notes."
         ),
-        task_id = result.task_id,
-        sha = result.sha,
-        target_path = result.target_path,
-        candidates_json = serde_json::to_string_pretty(&candidate_values)?,
-        emitted_json = serde_json::to_string_pretty(&emitted_values)?,
+        sha = job.sha,
+        finding_id = job.finding_id,
+        task_id = job.task_id,
+        target_path = job.target_path,
+        finding_index = job.finding_index,
+        finding_json = finding_json,
+        candidates_json = candidates_json,
     ))
 }
 
-fn build_scoring_request(args: &Args, model: &str, prompt: String) -> DirectRequest {
+fn build_agent_semantic_match_request(args: &Args, model: &str, prompt: String) -> DirectRequest {
     let schema = DirectJsonSchema {
-        name: "warden_semantic_scoring".to_string(),
-        schema: SchemaContract::new(scoring_response_schema()),
+        name: "warden_agent_semantic_match_pass".to_string(),
+        schema: SchemaContract::new(agent_semantic_match_schema()),
         strict: true,
     };
     let mut request = DirectRequest::json_schema(model.to_string(), prompt, schema);
@@ -6657,155 +6505,77 @@ fn build_scoring_request(args: &Args, model: &str, prompt: String) -> DirectRequ
     request
 }
 
-fn scoring_response_schema() -> serde_json::Value {
+fn agent_semantic_match_schema() -> serde_json::Value {
     serde_json::json!({
         "type": "object",
         "additionalProperties": false,
-        "required": ["scores"],
+        "required": ["verdict", "matchedCorpusIds", "notes"],
         "properties": {
-            "scores": {
+            "verdict": {
+                "type": "string",
+                "enum": ["known-found", "not-known"]
+            },
+            "matchedCorpusIds": {
                 "type": "array",
-                "items": {
-                    "type": "object",
-                    "additionalProperties": false,
-                    "required": [
-                        "findingIndex",
-                        "verdict",
-                        "matchedCorpusIds",
-                        "confidence",
-                        "notes"
-                    ],
-                    "properties": {
-                        "findingIndex": { "type": "integer", "minimum": 0 },
-                        "verdict": {
-                            "type": "string",
-                            "enum": ["known-found", "not-known"]
-                        },
-                        "matchedCorpusIds": {
-                            "type": "array",
-                            "items": { "type": "string" }
-                        },
-                        "confidence": {
-                            "type": "string",
-                            "enum": ["low", "medium", "high"]
-                        },
-                        "notes": { "type": "string" }
-                    }
-                }
+                "items": {"type": "string"}
+            },
+            "notes": {
+                "type": "string"
             }
         }
     })
 }
 
-fn score_rows_from_judge(
-    result: &TaskResult,
-    emitted: &[EmittedFinding],
-    candidates: &[CorpusFinding],
-    judge_response: ScoringJudgeResponse,
-    allow_partial: bool,
-) -> Result<Vec<SemanticScoreRow>> {
-    let emitted_by_index = emitted
+fn candidate_subset_for_job(job: &AgentScoringJob) -> Vec<&CorpusFinding> {
+    let paths = finding_paths(&job.finding, &job.target_path);
+    let filtered = job
+        .candidates
         .iter()
-        .map(|finding| (finding.index, finding))
-        .collect::<BTreeMap<_, _>>();
-    let candidate_ids = candidates
-        .iter()
-        .map(|finding| finding.id.as_str())
-        .collect::<BTreeSet<_>>();
-    let mut rows = Vec::new();
-    let mut seen = BTreeSet::new();
-
-    for verdict in judge_response.scores {
-        if !seen.insert(verdict.finding_index) {
-            if allow_partial {
-                continue;
-            }
-            bail!(
-                "judge returned duplicate findingIndex {}",
-                verdict.finding_index
-            );
-        }
-        let Some(emitted_finding) = emitted_by_index.get(&verdict.finding_index) else {
-            if allow_partial {
-                continue;
-            }
-            bail!(
-                "judge returned unknown findingIndex {}",
-                verdict.finding_index
-            );
-        };
-        let matched_corpus_ids = verdict
-            .matched_corpus_ids
-            .into_iter()
-            .filter(|id| candidate_ids.contains(id.as_str()))
-            .collect::<BTreeSet<_>>()
-            .into_iter()
-            .collect::<Vec<_>>();
-        let normalized_verdict = normalize_score_verdict(&verdict.verdict, &matched_corpus_ids);
-        rows.push(SemanticScoreRow {
-            task_id: result.task_id.clone(),
-            sha: result.sha.clone(),
-            target_path: result.target_path.clone(),
-            finding_index: verdict.finding_index,
-            finding: emitted_finding.value.clone(),
-            verdict: normalized_verdict,
-            matched_corpus_ids,
-            confidence: normalize_score_confidence(&verdict.confidence),
-            notes: verdict.notes,
-        });
-    }
-
-    let missing = emitted
-        .iter()
-        .filter(|finding| !seen.contains(&finding.index))
+        .filter(|candidate| paths.contains(&candidate.code.path))
         .collect::<Vec<_>>();
-    if !missing.is_empty() && !allow_partial {
-        bail!(
-            "judge returned {} score rows for {} emitted findings",
-            rows.len(),
-            emitted.len()
-        );
-    }
-    for finding in missing {
-        rows.push(SemanticScoreRow {
-            task_id: result.task_id.clone(),
-            sha: result.sha.clone(),
-            target_path: result.target_path.clone(),
-            finding_index: finding.index,
-            finding: finding.value.clone(),
-            verdict: "not-known".to_string(),
-            matched_corpus_ids: Vec::new(),
-            confidence: "low".to_string(),
-            notes: "Judge did not return a verdict for this emitted finding.".to_string(),
-        });
-    }
-    rows.sort_by_key(|row| row.finding_index);
-    Ok(rows)
-}
-
-fn normalize_score_verdict(raw: &str, matched_corpus_ids: &[String]) -> String {
-    let raw = raw.trim().to_ascii_lowercase().replace('_', "-");
-    if !matched_corpus_ids.is_empty() && (raw == "known-found" || raw == "known") {
-        "known-found".to_string()
+    if filtered.is_empty() {
+        job.candidates.iter().collect()
     } else {
-        "not-known".to_string()
+        filtered
     }
 }
 
-fn normalize_score_confidence(raw: &str) -> String {
-    match raw.trim().to_ascii_lowercase().as_str() {
-        "high" => "high".to_string(),
-        "medium" => "medium".to_string(),
-        _ => "low".to_string(),
+fn finding_paths(finding: &serde_json::Value, fallback_path: &str) -> BTreeSet<String> {
+    let mut paths = BTreeSet::from([fallback_path.to_string()]);
+    if let Some(path) = finding
+        .get("location")
+        .and_then(|location| location.get("path"))
+        .and_then(|value| value.as_str())
+        .filter(|value| !value.is_empty())
+    {
+        paths.insert(path.to_string());
     }
+    if let Some(locations) = finding
+        .get("additionalLocations")
+        .and_then(|value| value.as_array())
+    {
+        for location in locations {
+            if let Some(path) = location
+                .get("path")
+                .and_then(|value| value.as_str())
+                .filter(|value| !value.is_empty())
+            {
+                paths.insert(path.to_string());
+            }
+        }
+    }
+    paths
 }
 
-fn add_scoring_usage(totals: &mut ScoringUsageTotals, response: &LlmResponse) {
-    totals.input_tokens += response.usage.input_tokens.max(0) as u64;
-    totals.output_tokens += response.usage.output_tokens.max(0) as u64;
-    totals.reasoning_tokens += response.usage.reasoning_tokens.max(0) as u64;
-    totals.cache_read_input_tokens += response.usage.cached_input_tokens.max(0) as u64;
-    totals.provider_total_tokens = totals.input_tokens + totals.output_tokens;
+fn agent_corpus_candidate_value(finding: &CorpusFinding) -> serde_json::Value {
+    serde_json::json!({
+        "id": finding.id.clone(),
+        "summary": finding.summary.clone(),
+        "path": finding.code.path.clone(),
+        "lines": finding.code.lines.clone(),
+        "language": finding.code.language.clone(),
+        "snippet": finding.code.snippet.as_deref().map(|snippet| truncate_str(snippet, 600)),
+    })
 }
 
 fn merge_scoring_usage(totals: &mut ScoringUsageTotals, other: &ScoringUsageTotals) {
@@ -6813,28 +6583,12 @@ fn merge_scoring_usage(totals: &mut ScoringUsageTotals, other: &ScoringUsageTota
     totals.output_tokens += other.output_tokens;
     totals.reasoning_tokens += other.reasoning_tokens;
     totals.cache_read_input_tokens += other.cache_read_input_tokens;
+    totals.cache_creation_input_tokens += other.cache_creation_input_tokens;
+    totals.cache_creation_5m_input_tokens += other.cache_creation_5m_input_tokens;
+    totals.cache_creation_1h_input_tokens += other.cache_creation_1h_input_tokens;
+    totals.web_search_requests += other.web_search_requests;
     totals.provider_total_tokens = totals.input_tokens + totals.output_tokens;
-}
-
-fn estimate_scoring_cost(args: &Args, usage: &ScoringUsageTotals) -> serde_json::Value {
-    let tokens = TokenTotals {
-        input: usage.input_tokens,
-        output: usage.output_tokens,
-        reasoning: usage.reasoning_tokens,
-        cache: usage.cache_read_input_tokens,
-        cache_read: usage.cache_read_input_tokens,
-        cache_creation: 0,
-        non_cache_input: usage
-            .input_tokens
-            .saturating_sub(usage.cache_read_input_tokens),
-        provider_total: usage.provider_total_tokens,
-    };
-    let cost = PricingConfig::from_args(args).estimate(&tokens);
-    serde_json::json!({
-        "status": cost.status,
-        "usd": cost.total_usd,
-        "pricing": cost.pricing,
-    })
+    totals.cost_usd = round_usd(totals.cost_usd + other.cost_usd);
 }
 
 fn ratio4(numerator: usize, denominator: usize) -> f64 {
@@ -6872,7 +6626,7 @@ fn semantic_scoring_markdown(
     corpus_id_to_sha: &BTreeMap<String, String>,
 ) -> String {
     let known_total = scoring
-        .get("knownTotal")
+        .get("knownFindingCount")
         .and_then(|v| v.as_u64())
         .unwrap_or_default();
     let known_found = scoring
@@ -6883,14 +6637,11 @@ fn semantic_scoring_markdown(
         .get("knownFoundRate")
         .and_then(|v| v.as_f64())
         .unwrap_or_default();
-    let known_found_entries = scoring
-        .get("knownFoundEntries")
-        .and_then(|v| v.as_u64())
-        .unwrap_or_default();
-    let not_known_entries = scoring
-        .get("notKnownEntries")
-        .and_then(|v| v.as_u64())
-        .unwrap_or_default();
+    let known_found_entries = scores
+        .iter()
+        .filter(|score| score.verdict == "known-found")
+        .count();
+    let not_known_entries = scores.len().saturating_sub(known_found_entries);
 
     let mut found_by_sha: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
     for id in scores
@@ -6971,12 +6722,7 @@ fn semantic_scoring_markdown(
         out.push_str("(none)\n");
     } else {
         for score in not_known {
-            out.push_str(&format!(
-                "- `{}#F{}`: {}\n",
-                score.task_id,
-                score.finding_index + 1,
-                score.notes
-            ));
+            out.push_str(&format!("- `{}`: {}\n", score.finding_id, score.notes));
         }
     }
     out
@@ -7133,44 +6879,59 @@ fn run_git(cwd: &Path, args: &[&str]) -> Result<String> {
 fn build_standard_plugin_stack(
     standard_context_approach: Option<StandardContextApproach>,
 ) -> PluginStack {
-    let mut stack = standard_tool_stack(StandardToolStackOptions {
-        standard_context_approach,
-        tavily_api_key: None,
-        ..Default::default()
-    });
-    stack.push(Arc::new(LlmToolsPluginFactory::default()));
-    stack.push(Arc::new(subagents_factory()));
+    let mut stack = warden_read_only_repo_tool_stack();
+    push_standard_context_tools(&mut stack, standard_context_approach);
     stack
 }
 
 fn build_verification_plugin_stack() -> PluginStack {
-    let mut stack = standard_tool_stack(StandardToolStackOptions {
-        standard_context_approach: Some(
-            StandardContextApproach::RollingHistory(Default::default()),
-        ),
-        tavily_api_key: None,
-        include_cancel_process: false,
-    });
-    stack.push(Arc::new(LlmToolsPluginFactory::default()));
+    let mut stack = warden_read_only_repo_tool_stack();
+    push_standard_context_tools(
+        &mut stack,
+        Some(StandardContextApproach::RollingHistory(Default::default())),
+    );
     stack
 }
 
 fn build_rlm_plugin_stack() -> PluginStack {
-    let mut stack = standard_tool_stack(StandardToolStackOptions {
-        standard_context_approach: None,
-        tavily_api_key: None,
-        include_cancel_process: false,
-    });
-    stack.push(Arc::new(LlmToolsPluginFactory::default()));
-    stack.push(Arc::new(subagents_factory()));
+    warden_read_only_repo_tool_stack()
+}
+
+fn warden_read_only_repo_tool_stack() -> PluginStack {
+    let mut stack = locked_down_rlm_plugin_stack();
+    push_read_only_repo_tools(&mut stack);
     stack
 }
 
-fn subagents_factory() -> SubagentsPluginFactory {
-    SubagentsPluginFactory::new(Arc::new(CapabilityRegistry::new().with(Arc::new(
-        StaticCapability::new("default", SessionSpec::inherit()),
-    ))))
-    .with_session_spec(SessionSpec::inherit())
+fn push_standard_context_tools(
+    stack: &mut PluginStack,
+    standard_context_approach: Option<StandardContextApproach>,
+) {
+    match standard_context_approach {
+        Some(StandardContextApproach::RollingHistory(config)) => {
+            stack.push(Arc::new(RollingHistoryPluginFactory::new(config)));
+        }
+        Some(StandardContextApproach::ObservationalMemory(config)) => {
+            stack.push(Arc::new(ObservationalMemoryPluginFactory::new(config)));
+        }
+        None => {}
+    }
+}
+
+fn push_read_only_repo_tools(stack: &mut PluginStack) {
+    stack.push(Arc::new(StaticPluginFactory::new(
+        "read_file",
+        PluginSpec::new()
+            .with_tool_provider(Arc::new(read_file_provider()) as Arc<dyn ToolProvider>),
+    )));
+    stack.push(Arc::new(StaticPluginFactory::new(
+        "glob",
+        PluginSpec::new().with_tool_provider(Arc::new(glob_provider()) as Arc<dyn ToolProvider>),
+    )));
+    stack.push(Arc::new(StaticPluginFactory::new(
+        "grep",
+        PluginSpec::new().with_tool_provider(Arc::new(grep_provider()) as Arc<dyn ToolProvider>),
+    )));
 }
 
 fn resolve_provider(args: &Args) -> Result<(ProviderHandle, String, String)> {
@@ -7268,8 +7029,8 @@ fn aggregate_usage(report: &SessionUsageReport) -> TokenTotals {
     for row in &report.by_source_model {
         out.input += row.usage.input_tokens.max(0) as u64;
         out.output += row.usage.output_tokens.max(0) as u64;
-        out.cache_read += row.usage.cached_input_tokens.max(0) as u64;
-        out.reasoning += row.usage.reasoning_tokens.max(0) as u64;
+        out.cache_read += row.usage.cache_read_input_tokens.max(0) as u64;
+        out.reasoning += row.usage.reasoning_output_tokens.max(0) as u64;
     }
     out.cache = out.cache_read;
     out.non_cache_input = out.input.saturating_sub(out.cache_read);
@@ -8224,10 +7985,11 @@ fn run_summary_value(
         },
         "scoring": {
             "status": "unscored",
-            "knownTotal": selected_corpus_findings,
+            "knownFindingCount": selected_corpus_findings,
             "knownFound": null,
-            "precision": null,
-            "recall": null,
+            "knownMissed": null,
+            "knownPartial": null,
+            "knownFoundRate": null,
         },
         "failedTasks": failed_tasks.iter().map(|(task_id, error)| {
             serde_json::json!({
@@ -8349,8 +8111,8 @@ impl InstanceEventSink {
             let mut totals = self.live_usage.lock().unwrap_or_else(|e| e.into_inner());
             totals.input += usage.input_tokens.max(0) as u64;
             totals.output += usage.output_tokens.max(0) as u64;
-            totals.cache_read += usage.cached_input_tokens.max(0) as u64;
-            totals.reasoning += usage.reasoning_tokens.max(0) as u64;
+            totals.cache_read += usage.cache_read_input_tokens.max(0) as u64;
+            totals.reasoning += usage.reasoning_output_tokens.max(0) as u64;
             totals.cache = totals.cache_read;
             totals.non_cache_input = totals.input.saturating_sub(totals.cache_read);
             totals.provider_total = totals.input + totals.output;
@@ -8418,6 +8180,20 @@ impl TurnActivitySink for InstanceEventSink {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn tool_names_for_stack(stack: PluginStack) -> Vec<String> {
+        let mut factories = stack.into_factories();
+        factories.extend(lash_core::testing::test_standard_protocol_factories());
+        let host = lash_core::PluginHost::new(factories);
+        let session_id = "test".to_string();
+        let session = host.build_session(session_id.clone(), None).unwrap();
+        session
+            .resolved_tool_catalog(&session_id)
+            .unwrap()
+            .tool_names()
+            .as_ref()
+            .clone()
+    }
 
     fn sample_result() -> TaskResult {
         TaskResult {
@@ -8506,16 +8282,11 @@ mod tests {
         finding
     }
 
-    fn diff_hunk(start: usize, count: usize, content: &str) -> DiffHunk {
-        DiffHunk {
-            old_start: start,
-            old_count: count,
-            new_start: start,
-            new_count: count,
-            header: None,
-            content: content.to_string(),
-            lines: content.split('\n').map(str::to_string).collect(),
-        }
+    fn upstream_bridge_available() -> bool {
+        upstream_bridge_probe_direct()
+            .get("canExecuteTypeScript")
+            .and_then(|value| value.as_bool())
+            == Some(true)
     }
 
     fn upstream_bridge_reason() -> String {
@@ -8523,7 +8294,7 @@ mod tests {
         probe
             .get("blocker")
             .and_then(|value| value.as_str())
-            .unwrap_or("upstream TypeScript bridge is executable")
+            .unwrap_or("upstream Warden bridge is executable")
             .to_string()
     }
 
@@ -8540,13 +8311,26 @@ mod tests {
             });
         }
 
-        let local_tsx = Path::new("/tmp/ref-warden/node_modules/.bin/tsx");
+        let node = match command_path("node") {
+            Some(node) => node,
+            None => {
+                return serde_json::json!({"executed": false, "probe": probe, "blocker": "missing node executable"});
+            }
+        };
+        let upstream_extract = Path::new("/tmp/ref-warden/packages/warden/dist/sdk/extract.js");
+        if !upstream_extract.exists() {
+            return serde_json::json!({
+                "executed": false,
+                "probe": probe,
+                "blocker": "missing built upstream Warden dist at /tmp/ref-warden/packages/warden/dist/sdk/extract.js"
+            });
+        }
         let script_path = std::env::temp_dir().join(format!(
-            "warden-sentry-upstream-differential-{}.ts",
+            "warden-sentry-upstream-differential-{}.mjs",
             std::process::id()
         ));
         let script = r#"
-import { deduplicateFindings, applyMergeGroups } from '/tmp/ref-warden/packages/warden/src/sdk/extract.ts';
+import { deduplicateFindings, applyMergeGroups } from '/tmp/ref-warden/packages/warden/dist/sdk/extract.js';
 
 const findings = [
   {id:'FIX-001', severity:'high', confidence:'high', title:'Tenant bypass', description:'Unchecked organization slug reaches a lookup.', location:{path:'src/app.ts', startLine:10}},
@@ -8554,31 +8338,34 @@ const findings = [
   {id:'OTH-004', severity:'medium', confidence:'medium', title:'Tenant bypass elsewhere', description:'Same unchecked slug reaches another lookup.', location:{path:'src/other.ts', startLine:30}},
   {id:'GEN-005', severity:'medium', confidence:'low', title:'Issue', description:'Description'},
 ];
-const events:any[] = [];
-const deduped = deduplicateFindings(findings as any, (event:any) => events.push({
+const events = [];
+const deduped = deduplicateFindings(findings, (event) => events.push({
   stage: event.stage,
   action: event.action,
   findingId: event.finding?.id,
   replacementId: event.replacement?.id,
   reason: event.reason,
 }));
-const withLocations = deduped.filter((finding:any) => finding.location);
-const { absorbed, replacements } = applyMergeGroups(withLocations as any, [[1, 2]]);
+const withLocations = deduped.filter((finding) => finding.location);
+const { absorbed, replacements } = applyMergeGroups(withLocations, [[1, 2]]);
 for (const finding of absorbed) {
-  const replacement = [...replacements.values()].find((candidate:any) =>
-    candidate.additionalLocations?.some((loc:any) =>
+  const replacement = [...replacements.values()].find((candidate) =>
+    candidate.additionalLocations?.some((loc) =>
       loc.path === finding.location?.path && loc.startLine === finding.location?.startLine
     )
   );
   events.push({stage:'merge', action:'merged', findingId:finding.id, replacementId:replacement?.id, reason:'same root cause at another location'});
 }
-const merged = deduped.filter((finding:any) => !absorbed.has(finding)).map((finding:any) => replacements.get(finding) ?? finding);
+const merged = deduped.filter((finding) => !absorbed.has(finding)).map((finding) => replacements.get(finding) ?? finding);
 console.log(JSON.stringify({executed:true, finalFindings: merged, events}));
 "#;
         if let Err(err) = fs::write(&script_path, script) {
             return serde_json::json!({"executed": false, "probe": probe, "blocker": err.to_string()});
         }
-        let output = Command::new(local_tsx).arg(&script_path).output();
+        let output = Command::new(node)
+            .arg(&script_path)
+            .current_dir("/tmp/ref-warden/packages/warden")
+            .output();
         let _ = fs::remove_file(&script_path);
         match output {
             Ok(output) if output.status.success() => serde_json::from_slice(&output.stdout)
@@ -8605,16 +8392,18 @@ console.log(JSON.stringify({executed:true, finalFindings: merged, events}));
         sink.record_usage(&TokenUsage {
             input_tokens: 90,
             output_tokens: 9,
-            cached_input_tokens: 0,
-            reasoning_tokens: 1000,
+            cache_read_input_tokens: 0,
+            cache_write_input_tokens: 0,
+            reasoning_output_tokens: 1000,
         });
         assert!(!cancel.is_cancelled());
 
         sink.record_usage(&TokenUsage {
             input_tokens: 2,
             output_tokens: 0,
-            cached_input_tokens: 0,
-            reasoning_tokens: 0,
+            cache_read_input_tokens: 0,
+            cache_write_input_tokens: 0,
+            reasoning_output_tokens: 0,
         });
         assert!(cancel.is_cancelled());
         assert!(
@@ -8652,25 +8441,28 @@ console.log(JSON.stringify({executed:true, finalFindings: merged, events}));
     }
 
     #[test]
-    fn chunks_match_warden_gap_size_sorting_and_utf16_size_rules() {
-        let merged = coalesce_hunks(
-            vec![diff_hunk(10, 5, "second"), diff_hunk(1, 5, "first")],
-            10,
-            8_000,
-        );
-        assert_eq!(merged.len(), 1);
-        assert_eq!(merged[0].new_start, 1);
-        assert_eq!(merged[0].new_count, 14);
-        assert!(merged[0].content.contains("first"));
-        assert!(merged[0].content.contains("second"));
+    fn chunking_uses_upstream_warden_bridge_when_available() {
+        if !upstream_bridge_available() {
+            return;
+        }
 
-        let separate = coalesce_hunks(
-            vec![diff_hunk(1, 5, "first"), diff_hunk(50, 5, "second")],
-            WARDEN_MAX_GAP_LINES,
-            8_000,
-        );
-        assert_eq!(separate.len(), 2);
-        assert_eq!(js_string_len("\u{1F600}"), 2);
+        let content = (0..200)
+            .map(|index| format!("const value{index} = \"\u{1F600}\";"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let output = run_upstream_warden_bridge(serde_json::json!({
+            "mode": "chunkFile",
+            "filename": "src/app.ts",
+            "content": content,
+            "maxGapLines": WARDEN_MAX_GAP_LINES,
+            "maxChunkSize": 200,
+        }))
+        .unwrap();
+        let hunks = serde_json::from_value::<Vec<DiffHunk>>(output["hunks"].clone()).unwrap();
+
+        assert!(!hunks.is_empty());
+        assert!(hunks.iter().any(|hunk| hunk.content.contains("\u{1F600}")));
+        assert!(hunks.iter().all(|hunk| hunk.new_count > 0));
     }
 
     #[test]
@@ -8686,9 +8478,11 @@ console.log(JSON.stringify({executed:true, finalFindings: merged, events}));
                 bridge_reason.contains("missing /tmp/ref-warden/node_modules")
                     || bridge_reason.contains("missing upstream Warden source")
                     || bridge_reason.contains("missing node")
-                    || bridge_reason.contains("missing local tsx"),
+                    || bridge_reason.contains("missing local tsx")
+                    || bridge_reason.contains("missing built upstream Warden dist"),
                 "unexpected upstream bridge blocker: {bridge_reason}"
             );
+            return;
         }
 
         let first = PostProcessFinding {
@@ -8760,7 +8554,8 @@ console.log(JSON.stringify({executed:true, finalFindings: merged, events}));
         let general = post_finding_without_location("GEN-005");
 
         let (deduped, mut events) =
-            deduplicate_post_findings(vec![first, duplicate, rejected, other, general]);
+            deduplicate_with_upstream_warden(vec![first, duplicate, rejected, other, general])
+                .unwrap();
         let mut verified = Vec::new();
         for mut candidate in deduped {
             let original = candidate.finding.clone();
@@ -8823,12 +8618,12 @@ console.log(JSON.stringify({executed:true, finalFindings: merged, events}));
             .enumerate()
             .filter_map(|(index, finding)| finding.finding.location.is_some().then_some(index))
             .collect::<Vec<_>>();
-        let groups = map_merge_groups_to_original_one_based_indices(
-            &[vec![1, 2]],
+        let (merged, merge_events, absorbed, _) = apply_merge_groups_with_upstream_warden(
+            verified,
             &located_original_indices,
-        );
-        let (merged, merge_events, absorbed) =
-            apply_merge_groups_to_post_findings(verified, &groups);
+            &[vec![1, 2]],
+        )
+        .unwrap();
         events.extend(merge_events);
 
         assert_eq!(absorbed, 1);
@@ -8981,12 +8776,17 @@ console.log(JSON.stringify({executed:true, finalFindings: merged, events}));
             "Verify this candidate. Return keep, revise, or reject.",
             "read_file",
             "glob",
-            "rg/git grep",
-            "Do not edit files.",
+            "grep",
         ] {
             assert!(
                 prompt.contains(required),
                 "missing prompt contract: {required}"
+            );
+        }
+        for forbidden in ["Do not edit files.", "Do not spawn subagents"] {
+            assert!(
+                !prompt.contains(forbidden),
+                "prompt should not mention unavailable tools: {forbidden}"
             );
         }
 
@@ -8996,6 +8796,39 @@ console.log(JSON.stringify({executed:true, finalFindings: merged, events}));
             assert!(source.contains("Use read-only tools to inspect the repository. Read the reported file and use Grep/Glob"));
             assert!(source.contains("const VERIFICATION_CONCURRENCY = 4"));
             assert!(source.contains("revised.location = finding.location"));
+        }
+    }
+
+    #[test]
+    fn warden_repo_agents_expose_only_read_only_repo_tools() {
+        for names in [
+            tool_names_for_stack(build_standard_plugin_stack(Some(
+                StandardContextApproach::RollingHistory(Default::default()),
+            ))),
+            tool_names_for_stack(build_verification_plugin_stack()),
+            tool_names_for_stack(build_rlm_plugin_stack()),
+        ] {
+            for expected in ["batch", "read_file", "grep", "glob"] {
+                assert!(
+                    names.contains(&expected.to_string()),
+                    "missing {expected}: {names:?}"
+                );
+            }
+            for forbidden in [
+                "exec_command",
+                "start_command",
+                "write_stdin",
+                "list_process_handles",
+                "edit",
+                "write",
+                "llm_query",
+                "spawn_agent",
+            ] {
+                assert!(
+                    !names.contains(&forbidden.to_string()),
+                    "unexpected {forbidden}: {names:?}"
+                );
+            }
         }
     }
 
@@ -9041,6 +8874,10 @@ console.log(JSON.stringify({executed:true, finalFindings: merged, events}));
 
     #[test]
     fn deduplicates_by_title_path_and_start_line() {
+        if !upstream_bridge_available() {
+            return;
+        }
+
         let first = post_finding("AAA-111", "medium", "src/a.py", 10);
         let mut duplicate = post_finding("BBB-222", "high", "src/a.py", 10);
         duplicate.finding.title = first.finding.title.clone();
@@ -9049,7 +8886,8 @@ console.log(JSON.stringify({executed:true, finalFindings: merged, events}));
         different_start.finding.title = first.finding.title.clone();
 
         let (deduped, events) =
-            deduplicate_post_findings(vec![first.clone(), duplicate.clone(), different_start]);
+            deduplicate_with_upstream_warden(vec![first.clone(), duplicate, different_start])
+                .unwrap();
 
         assert_eq!(deduped.len(), 2);
         assert_eq!(deduped[0].finding.id, first.finding.id);
@@ -9131,12 +8969,20 @@ console.log(JSON.stringify({executed:true, finalFindings: merged, events}));
 
     #[test]
     fn applies_cross_location_merge_groups_with_warden_priority() {
+        if !upstream_bridge_available() {
+            return;
+        }
+
         let low = post_finding("LOW-111", "low", "src/b.py", 20);
         let high = post_finding("HGH-222", "high", "src/a.py", 10);
         let other = post_finding("MED-333", "medium", "src/c.py", 30);
 
-        let (merged, events, absorbed) =
-            apply_merge_groups_to_post_findings(vec![low, high, other], &[vec![1, 2, 3]]);
+        let (merged, events, absorbed, _) = apply_merge_groups_with_upstream_warden(
+            vec![low, high, other],
+            &[0, 1, 2],
+            &[vec![1, 2, 3]],
+        )
+        .unwrap();
 
         assert_eq!(absorbed, 2);
         assert_eq!(merged.len(), 1);
@@ -9158,14 +9004,20 @@ console.log(JSON.stringify({executed:true, finalFindings: merged, events}));
 
     #[test]
     fn merge_groups_from_located_prompt_map_back_to_original_findings() {
+        if !upstream_bridge_available() {
+            return;
+        }
+
         let general = post_finding_without_location("GEN-000");
         let low = post_finding("LOW-111", "low", "src/b.py", 20);
         let high = post_finding("HGH-222", "high", "src/a.py", 10);
-        let groups = map_merge_groups_to_original_one_based_indices(&[vec![1, 2]], &[1, 2]);
 
-        assert_eq!(groups, vec![vec![2, 3]]);
-        let (merged, events, absorbed) =
-            apply_merge_groups_to_post_findings(vec![general, low, high], &groups);
+        let (merged, events, absorbed, _) = apply_merge_groups_with_upstream_warden(
+            vec![general, low, high],
+            &[1, 2],
+            &[vec![1, 2]],
+        )
+        .unwrap();
 
         assert_eq!(absorbed, 1);
         assert_eq!(events.len(), 1);
@@ -9534,25 +9386,24 @@ console.log(JSON.stringify({executed:true, finalFindings: merged, events}));
         fs::write(
             temp_dir.join(SEMANTIC_SCORING_ARTIFACT),
             serde_json::json!({
+                "runId": "validation-run",
+                "corpusId": "sentry-vulnerability-corpus",
                 "scoring": {
-                    "inputArtifact": WARDEN_FINAL_JSONL_ARTIFACT,
-                    "inputState": "finalized",
-                    "wardenComparable": true,
-                    "status": "scored",
-                    "reviewer": "lash-direct-llm-semantic-match",
-                    "method": "direct_llm_semantic_match",
-                    "knownFound": 1,
-                    "knownTotal": 1,
+                    "reviewer": AGENT_SEMANTIC_MATCH_PASS,
+                    "scoredAt": "2026-07-01",
                     "knownFindingCount": 1,
+                    "knownFound": 1,
                     "knownMissed": 0,
-                    "knownFoundEntries": 1,
-                    "notKnownEntries": 0,
-                    "emittedFindings": 1,
-                    "recall": 1.0,
+                    "knownPartial": 0,
                     "knownFoundRate": 1.0,
-                    "precision": 1.0,
-                    "judge": {"cost": {"usd": 0.0}}
-                }
+                    "notes": "Agent-verified semantic matches. A finding counts when it identifies the same bug in roughly the same location as an existing corpus finding. Same-file findings about different bugs do not count."
+                },
+                "scores": [{
+                    "findingId": "FIN-123",
+                    "matchedCorpusIds": ["sentry-vuln-001"],
+                    "verdict": "known-found",
+                    "notes": "same issue"
+                }]
             })
             .to_string(),
         )
@@ -9570,23 +9421,14 @@ console.log(JSON.stringify({executed:true, finalFindings: merged, events}));
                     "auxiliaryCostUSD": 0.0
                 },
                 "scoring": {
-                    "status": "scored",
-                    "inputArtifact": WARDEN_FINAL_JSONL_ARTIFACT,
-                    "inputState": "finalized",
-                    "wardenComparable": true,
-                    "reviewer": "lash-direct-llm-semantic-match",
-                    "method": "direct_llm_semantic_match",
-                    "knownFound": 1,
-                    "knownTotal": 1,
+                    "reviewer": AGENT_SEMANTIC_MATCH_PASS,
+                    "scoredAt": "2026-07-01",
                     "knownFindingCount": 1,
+                    "knownFound": 1,
                     "knownMissed": 0,
-                    "knownFoundEntries": 1,
-                    "notKnownEntries": 0,
-                    "emittedFindings": 1,
-                    "recall": 1.0,
+                    "knownPartial": 0,
                     "knownFoundRate": 1.0,
-                    "precision": 1.0,
-                    "judge": {"cost": {"usd": 0.0}},
+                    "notes": "Agent-verified semantic matches. A finding counts when it identifies the same bug in roughly the same location as an existing corpus finding. Same-file findings about different bugs do not count.",
                     "nonComparablePreviousArtifacts": [
                         "semantic-scoring.raw-pre-finalization.json",
                         "semantic-scoring-summary.raw-pre-finalization.md"
@@ -9716,7 +9558,200 @@ console.log(JSON.stringify({executed:true, finalFindings: merged, events}));
     }
 
     #[test]
+    fn agent_semantic_match_jobs_score_finalized_findings_against_presented_candidates() {
+        let sha = "788ba30f1aa42b00c02d64ed4b8b2515ff8ab8da".to_string();
+        let empty_sha = "899ba30f1aa42b00c02d64ed4b8b2515ff8ab8da".to_string();
+        let mut first = sample_result();
+        first.task_id = "task-a".to_string();
+        first.sha = sha.clone();
+        first.target_path = "src/a.py".to_string();
+        let mut first_finding = finding("F-A", "high", Some("high"), "src/a.py", 12);
+        first_finding.additional_locations = Some(vec![WardenLocation {
+            path: "src/b.py".to_string(),
+            start_line: 18,
+            end_line: None,
+        }]);
+        first.parsed_response = Some(serde_json::json!({
+            "findings": [first_finding]
+        }));
+
+        let mut second = sample_result();
+        second.task_id = "task-b".to_string();
+        second.sha = sha.clone();
+        second.target_path = "src/b.py".to_string();
+        second.parsed_response = Some(serde_json::json!({
+            "findings": [finding("F-B", "medium", Some("medium"), "src/b.py", 18)]
+        }));
+
+        let mut empty = sample_result();
+        empty.task_id = "task-empty".to_string();
+        empty.sha = empty_sha.clone();
+        empty.target_path = "src/empty.py".to_string();
+        empty.parsed_response = Some(serde_json::json!({"findings": []}));
+
+        let candidates = vec![
+            CorpusFinding {
+                id: "CORPUS-A".to_string(),
+                repository: DEFAULT_REPOSITORY.to_string(),
+                sha: sha.clone(),
+                summary: "first expected vulnerability".to_string(),
+                code: CorpusCode {
+                    path: "src/a.py".to_string(),
+                    lines: Some("12".to_string()),
+                    language: Some("python".to_string()),
+                    snippet: None,
+                },
+            },
+            CorpusFinding {
+                id: "CORPUS-B".to_string(),
+                repository: DEFAULT_REPOSITORY.to_string(),
+                sha: sha.clone(),
+                summary: "second expected vulnerability".to_string(),
+                code: CorpusCode {
+                    path: "src/b.py".to_string(),
+                    lines: Some("18".to_string()),
+                    language: Some("python".to_string()),
+                    snippet: None,
+                },
+            },
+            CorpusFinding {
+                id: "CORPUS-C".to_string(),
+                repository: DEFAULT_REPOSITORY.to_string(),
+                sha: sha.clone(),
+                summary: "third expected vulnerability".to_string(),
+                code: CorpusCode {
+                    path: "src/c.py".to_string(),
+                    lines: Some("42".to_string()),
+                    language: Some("python".to_string()),
+                    snippet: None,
+                },
+            },
+        ];
+        let empty_candidates = vec![CorpusFinding {
+            id: "CORPUS-EMPTY".to_string(),
+            repository: DEFAULT_REPOSITORY.to_string(),
+            sha: empty_sha.clone(),
+            summary: "expected vulnerability with no emitted finding".to_string(),
+            code: CorpusCode {
+                path: "src/empty.py".to_string(),
+                lines: Some("22".to_string()),
+                language: Some("python".to_string()),
+                snippet: None,
+            },
+        }];
+        let corpus_by_sha = BTreeMap::from([
+            (sha.clone(), candidates.clone()),
+            (empty_sha.clone(), empty_candidates),
+        ]);
+        let jobs = build_agent_scoring_jobs(&[first, second, empty], &corpus_by_sha);
+
+        assert_eq!(jobs.len(), 2);
+        let first_job = jobs
+            .iter()
+            .find(|job| job.finding_id == "F-A")
+            .expect("first emitted finding job");
+        assert_eq!(first_job.sha, sha);
+        assert_eq!(first_job.task_id, "task-a");
+        assert_eq!(first_job.finding_index, 0);
+        assert_eq!(first_job.candidates.len(), 3);
+        assert_eq!(
+            candidate_subset_for_job(first_job)
+                .into_iter()
+                .map(|finding| finding.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["CORPUS-A", "CORPUS-B"]
+        );
+
+        let request = build_agent_semantic_match_prompt(first_job).unwrap();
+        assert!(request.contains("agent-semantic-match-pass"));
+        assert!(request.contains("\"id\": \"CORPUS-A\""));
+        assert!(request.contains("\"id\": \"CORPUS-B\""));
+        assert!(!request.contains("\"id\": \"CORPUS-C\""));
+
+        let row = score_row_from_agent_match(
+            first_job,
+            AgentSemanticMatchResponse {
+                verdict: "known-found".to_string(),
+                matched_corpus_ids: vec!["CORPUS-B".to_string()],
+                notes: "same root cause at additional location".to_string(),
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            row,
+            SemanticScoreRow {
+                finding_id: "F-A".to_string(),
+                verdict: "known-found".to_string(),
+                matched_corpus_ids: vec!["CORPUS-B".to_string()],
+                notes: "same root cause at additional location".to_string(),
+            }
+        );
+
+        assert!(
+            score_row_from_agent_match(
+                first_job,
+                AgentSemanticMatchResponse {
+                    verdict: "known-found".to_string(),
+                    matched_corpus_ids: vec!["CORPUS-C".to_string()],
+                    notes: "invalid candidate".to_string(),
+                },
+            )
+            .is_err()
+        );
+        assert!(
+            score_row_from_agent_match(
+                first_job,
+                AgentSemanticMatchResponse {
+                    verdict: "not-known".to_string(),
+                    matched_corpus_ids: vec!["CORPUS-A".to_string()],
+                    notes: "inconsistent".to_string(),
+                },
+            )
+            .is_err()
+        );
+        assert!(
+            score_row_from_agent_match(
+                first_job,
+                AgentSemanticMatchResponse {
+                    verdict: "known-found".to_string(),
+                    matched_corpus_ids: Vec::new(),
+                    notes: "missing match".to_string(),
+                },
+            )
+            .is_err()
+        );
+
+        let second_job = jobs
+            .iter()
+            .find(|job| job.finding_id == "F-B")
+            .expect("second emitted finding job");
+        assert_eq!(
+            candidate_subset_for_job(second_job)
+                .into_iter()
+                .map(|finding| finding.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["CORPUS-B"]
+        );
+        let second_row = score_row_from_agent_match(
+            second_job,
+            AgentSemanticMatchResponse {
+                verdict: "not-known".to_string(),
+                matched_corpus_ids: Vec::new(),
+                notes: "different issue".to_string(),
+            },
+        )
+        .unwrap();
+        assert_eq!(second_row.finding_id, "F-B");
+        assert_eq!(second_row.verdict, "not-known");
+        assert!(second_row.matched_corpus_ids.is_empty());
+    }
+
+    #[test]
     fn end_to_end_post_processing_golden_finalizes_and_scores_from_final_jsonl() {
+        if !upstream_bridge_available() {
+            return;
+        }
+
         let temp_dir = std::env::temp_dir().join(format!(
             "warden-sentry-post-process-golden-{}",
             std::process::id()
@@ -9798,7 +9833,7 @@ console.log(JSON.stringify({executed:true, finalFindings: merged, events}));
         assert_eq!(counters.raw_findings, 4);
         assert_eq!(counters.normalized_findings, 4);
 
-        let (deduped, mut events) = deduplicate_post_findings(normalized);
+        let (deduped, mut events) = deduplicate_with_upstream_warden(normalized).unwrap();
         assert_eq!(deduped.len(), 3);
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].stage, "dedupe");
@@ -9861,8 +9896,17 @@ console.log(JSON.stringify({executed:true, finalFindings: merged, events}));
         assert!(events.iter().any(|event| event.action == "revised"));
         assert!(events.iter().any(|event| event.action == "rejected"));
 
-        let (merged, merge_events, absorbed) =
-            apply_merge_groups_to_post_findings(verified, &[vec![1, 2]]);
+        let located_original_indices = verified
+            .iter()
+            .enumerate()
+            .filter_map(|(index, finding)| finding.finding.location.is_some().then_some(index))
+            .collect::<Vec<_>>();
+        let (merged, merge_events, absorbed, _) = apply_merge_groups_with_upstream_warden(
+            verified,
+            &located_original_indices,
+            &[vec![1, 2]],
+        )
+        .unwrap();
         events.extend(merge_events);
         assert_eq!(absorbed, 1);
         assert_eq!(merged.len(), 1);
