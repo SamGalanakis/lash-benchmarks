@@ -131,6 +131,30 @@ lash_ref_label() {
   fi
 }
 
+expected_lash_version_from_pin() {
+  if [[ "${LASH_GIT_TAG}" =~ ^v?([0-9]+(\.[0-9A-Za-z-]+)+)$ ]]; then
+    printf '%s' "${BASH_REMATCH[1]}"
+  fi
+}
+
+assert_lash_binary_matches_pin() {
+  local expected
+  expected="$(expected_lash_version_from_pin)"
+  if [[ -z "${expected}" ]]; then
+    return 0
+  fi
+  local actual
+  actual="$("${BINARY_PATH}" --version 2>/dev/null | head -n 1 || true)"
+  if [[ "${actual}" != *"${expected}"* ]]; then
+    cat >&2 <<EOF
+error: lash binary at ${BINARY_PATH} does not match ${LASH_GIT_TAG}.
+Expected version containing '${expected}', got: ${actual:-<no version output>}.
+Re-run without --no-build or update LASH_BENCH_BINARY.
+EOF
+    exit 1
+  fi
+}
+
 DATASET="${TERMINALBENCH_DATASET}"
 AGENT="lash"
 JOBS_DIR="jobs"
@@ -771,6 +795,9 @@ EOF
   if [[ "${AGENT}" == "lash" ]] && [[ ! -x "${BINARY_PATH}" ]]; then
     echo "error: expected executable lash binary not found at ${BINARY_PATH}" >&2
     exit 1
+  fi
+  if [[ "${AGENT}" == "lash" ]]; then
+    assert_lash_binary_matches_pin
   fi
 fi
 

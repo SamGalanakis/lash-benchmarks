@@ -4,7 +4,6 @@ use std::cmp::Ordering;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, File, OpenOptions};
 use std::io::Write;
-use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::{Arc, LazyLock, Mutex};
@@ -13,28 +12,23 @@ use std::time::Instant;
 use anyhow::{Context, Result, bail};
 use chrono::{DateTime, Utc};
 use clap::{Parser, ValueEnum};
+use lash::advanced::{TurnFinish, TurnOutcome, TurnStop};
+use lash::direct::{DirectJsonSchema, DirectLlmClient, DirectRequest, LlmResponse};
 use lash::persistence::RuntimePersistence;
 use lash::provider::ProviderHandle;
-use lash::rlm::{RlmFinalAnswerFormat, RlmSessionBuilderExt as _, RlmTurnBuilderExt as _};
+use lash::tools::ToolProvider;
 use lash::usage::{SessionUsageReport, TokenUsage};
 use lash::{
-    LashCore, LashSession, ModelSpec, PluginStack, TurnActivity, TurnActivitySink, TurnEvent,
-    TurnInput,
+    LashCore, LashSession, PluginStack, TurnActivity, TurnActivitySink, TurnEvent, TurnInput,
 };
-use lash::{TurnFinish, TurnOutcome, TurnStop};
+use lash_core::StandardContextApproach;
 use lash_core::plugin::{PluginSpec, StaticPluginFactory};
-use lash_core::{
-    DirectJsonSchema, DirectLlmClient, DirectRequest, GenerationOptions, LlmResponse,
-    SchemaContract, TestLocalProcessRegistry, ToolProvider,
-};
 use lash_plugin_observational_memory::ObservationalMemoryPluginFactory;
-use lash_search_tools::grep_provider;
+use lash_plugin_rolling_history::RollingHistoryPluginFactory;
+use lash_plugin_tool_discovery::ToolDiscoveryPluginFactory;
 use lash_sqlite_store::Store;
-use lash_standard_plugins::locked_down_rlm_plugin_stack;
-use lash_standard_plugins::{
-    StandardContextApproach, rolling_history::RollingHistoryPluginFactory,
-};
-use lash_tools::files::{glob_provider, read_file_provider};
+use lash_tool_files::{Glob, ReadFilePluginFactory};
+use lash_tool_search::Grep;
 use regex::Regex;
 use serde::{Deserialize, Serialize};
 use tokio::sync::Semaphore;
@@ -503,7 +497,7 @@ struct TaskResult {
     input_tokens: u64,
     output_tokens: u64,
     reasoning_tokens: u64,
-    cache_read_input_tokens: u64,
+    cached_input_tokens: u64,
     cache_creation_input_tokens: u64,
     non_cache_input_tokens: u64,
     provider_total_tokens: u64,
@@ -563,7 +557,7 @@ struct WardenUsageStats {
     input_tokens: u64,
     output_tokens: u64,
     #[serde(skip_serializing_if = "Option::is_none")]
-    cache_read_input_tokens: Option<u64>,
+    cached_input_tokens: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     cache_creation_input_tokens: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -757,7 +751,7 @@ struct ScoringUsageTotals {
     input_tokens: u64,
     output_tokens: u64,
     reasoning_tokens: u64,
-    cache_read_input_tokens: u64,
+    cached_input_tokens: u64,
     cache_creation_input_tokens: u64,
     cache_creation_5m_input_tokens: u64,
     cache_creation_1h_input_tokens: u64,
@@ -1988,34 +1982,17 @@ async fn run_repo_aware_verification_turn(
     let trace_path = artifact_dir.join("session.trace.jsonl");
     let events_path = artifact_dir.join("events.jsonl");
     let store = Arc::new(
-        Store::open(&store_path)
-            .await
-            .with_context(|| format!("open {}", store_path.display()))?,
+        Store::open(&store_path).with_context(|| format!("open {}", store_path.display()))?,
     );
-    let model_spec = ModelSpec::from_token_limits(
-        resolved_model.to_string(),
-        args.variant.clone(),
-        args.max_context_tokens,
-        None,
-    )
-    .map_err(anyhow::Error::msg)?;
 
     let sink = Arc::new(InstanceEventSink::new(events_path.clone())?);
-    let mut builder = LashCore::standard_builder()
+    let mut builder = LashCore::standard()
         .provider(provider)
-        .model(model_spec)
+        .model(resolved_model.to_string(), args.variant.clone())
+        .max_context_tokens(args.max_context_tokens)
         .max_turns(args.max_turns)
-        .store_factory(Arc::new(
-            lash::persistence::InMemorySessionStoreFactory::new(),
-        ))
-        .process_registry(Arc::new(TestLocalProcessRegistry::default()))
-        .process_env_store(Arc::new(
-            lash::persistence::InMemoryProcessExecutionEnvStore::new(),
-        ))
-        .plugins(build_verification_plugin_stack())
-        .effect_host(Arc::new(lash::durability::InlineEffectHost::default()))
-        .attachment_store(Arc::new(lash::persistence::InMemoryAttachmentStore::new()));
-    builder = builder.trace_jsonl_path(trace_path.clone());
+        .plugins(build_verification_plugin_stack());
+    builder = builder.trace_jsonl_path(Some(trace_path.clone()));
     let core = builder.build()?;
     let session = core
         .session("verification")
@@ -2588,14 +2565,12 @@ fn build_merge_prompt(findings: &[PostProcessFinding], repo_dir: &Path) -> Resul
 fn build_merge_request(args: &Args, model: &str, prompt: String) -> DirectRequest {
     let schema = DirectJsonSchema {
         name: "warden_cross_location_merge".to_string(),
-        schema: SchemaContract::new(merge_groups_response_schema()),
+        schema: merge_groups_response_schema(),
         strict: true,
     };
     let mut request = DirectRequest::json_schema(model.to_string(), prompt, schema);
     request.model_variant = args.variant.clone();
-    request.generation = GenerationOptions {
-        output_token_cap: NonZeroUsize::new(args.post_process_max_output_tokens.min(512)),
-    };
+    let _ = args.post_process_max_output_tokens;
     request
 }
 
@@ -2756,8 +2731,8 @@ fn read_repo_snippet(
 fn usage_stats_from_response(args: &Args, response: &LlmResponse) -> WardenUsageStats {
     let input = response.usage.input_tokens.max(0) as u64;
     let output = response.usage.output_tokens.max(0) as u64;
-    let cache_read = response.usage.cache_read_input_tokens.max(0) as u64;
-    let reasoning = response.usage.reasoning_output_tokens.max(0) as u64;
+    let cache_read = response.usage.cached_input_tokens.max(0) as u64;
+    let reasoning = response.usage.reasoning_tokens.max(0) as u64;
     let tokens = TokenTotals {
         input,
         output,
@@ -2776,7 +2751,7 @@ fn usage_stats_from_token_totals(args: &Args, tokens: &TokenTotals) -> WardenUsa
     WardenUsageStats {
         input_tokens: tokens.input,
         output_tokens: tokens.output,
-        cache_read_input_tokens: (tokens.cache_read > 0).then_some(tokens.cache_read),
+        cached_input_tokens: (tokens.cache_read > 0).then_some(tokens.cache_read),
         cache_creation_input_tokens: (tokens.cache_creation > 0).then_some(tokens.cache_creation),
         cache_creation_5m_input_tokens: None,
         cache_creation_1h_input_tokens: None,
@@ -2789,8 +2764,7 @@ fn usage_stats_from_task_result(result: &TaskResult) -> WardenUsageStats {
     WardenUsageStats {
         input_tokens: result.input_tokens,
         output_tokens: result.output_tokens,
-        cache_read_input_tokens: (result.cache_read_input_tokens > 0)
-            .then_some(result.cache_read_input_tokens),
+        cached_input_tokens: (result.cached_input_tokens > 0).then_some(result.cached_input_tokens),
         cache_creation_input_tokens: (result.cache_creation_input_tokens > 0)
             .then_some(result.cache_creation_input_tokens),
         cache_creation_5m_input_tokens: None,
@@ -2803,7 +2777,7 @@ fn usage_stats_from_task_result(result: &TaskResult) -> WardenUsageStats {
 fn usage_stats_have_value(usage: &WardenUsageStats) -> bool {
     usage.input_tokens > 0
         || usage.output_tokens > 0
-        || usage.cache_read_input_tokens.unwrap_or(0) > 0
+        || usage.cached_input_tokens.unwrap_or(0) > 0
         || usage.cache_creation_input_tokens.unwrap_or(0) > 0
         || usage.cache_creation_5m_input_tokens.unwrap_or(0) > 0
         || usage.cache_creation_1h_input_tokens.unwrap_or(0) > 0
@@ -2815,9 +2789,9 @@ fn add_warden_usage(a: &mut WardenUsageStats, b: &WardenUsageStats) {
     a.input_tokens += b.input_tokens;
     a.output_tokens += b.output_tokens;
     a.cost_usd = round_usd(a.cost_usd + b.cost_usd);
-    if a.cache_read_input_tokens.is_some() || b.cache_read_input_tokens.is_some() {
-        a.cache_read_input_tokens =
-            Some(a.cache_read_input_tokens.unwrap_or(0) + b.cache_read_input_tokens.unwrap_or(0));
+    if a.cached_input_tokens.is_some() || b.cached_input_tokens.is_some() {
+        a.cached_input_tokens =
+            Some(a.cached_input_tokens.unwrap_or(0) + b.cached_input_tokens.unwrap_or(0));
     }
     if a.cache_creation_input_tokens.is_some() || b.cache_creation_input_tokens.is_some() {
         a.cache_creation_input_tokens = Some(
@@ -4954,10 +4928,7 @@ async fn run_score(args: Args) -> Result<()> {
     eprintln!("  emitted_scored:   {}", scores.len());
     eprintln!(
         "  score_tokens:     input={} output={} reasoning={} cache_read={}",
-        usage.input_tokens,
-        usage.output_tokens,
-        usage.reasoning_tokens,
-        usage.cache_read_input_tokens
+        usage.input_tokens, usage.output_tokens, usage.reasoning_tokens, usage.cached_input_tokens
     );
     eprintln!("  progress:         {}", progress_path.display());
     Ok(())
@@ -5125,8 +5096,8 @@ fn normalize_agent_match_verdict(raw: &str, matched_corpus_ids: &[String]) -> St
 fn add_scoring_usage(totals: &mut ScoringUsageTotals, response: &LlmResponse) {
     totals.input_tokens += response.usage.input_tokens.max(0) as u64;
     totals.output_tokens += response.usage.output_tokens.max(0) as u64;
-    totals.reasoning_tokens += response.usage.reasoning_output_tokens.max(0) as u64;
-    totals.cache_read_input_tokens += response.usage.cache_read_input_tokens.max(0) as u64;
+    totals.reasoning_tokens += response.usage.reasoning_tokens.max(0) as u64;
+    totals.cached_input_tokens += response.usage.cached_input_tokens.max(0) as u64;
     totals.provider_total_tokens = totals.input_tokens + totals.output_tokens;
 }
 
@@ -5670,17 +5641,8 @@ async fn run_task(ctx: RunTaskContext<'_>, task: &WardenTask) -> Result<TaskResu
     let trace_path = task_dir.join("session.trace.jsonl");
     let events_path = task_dir.join("events.jsonl");
     let store = Arc::new(
-        Store::open(&store_path)
-            .await
-            .with_context(|| format!("open {}", store_path.display()))?,
+        Store::open(&store_path).with_context(|| format!("open {}", store_path.display()))?,
     );
-    let model_spec = ModelSpec::from_token_limits(
-        model.to_string(),
-        args.variant.clone(),
-        args.max_context_tokens,
-        None,
-    )
-    .map_err(anyhow::Error::msg)?;
 
     std::env::set_current_dir(&repo_dir)
         .with_context(|| format!("cd into {}", repo_dir.display()))?;
@@ -5688,23 +5650,15 @@ async fn run_task(ctx: RunTaskContext<'_>, task: &WardenTask) -> Result<TaskResu
     let turn_started = Instant::now();
     let telemetry = match execution_mode {
         ExecutionMode::Standard => {
-            let mut builder = LashCore::standard_builder()
+            let mut builder = LashCore::standard()
                 .provider(provider.clone())
-                .model(model_spec)
+                .model(model.to_string(), args.variant.clone())
+                .max_context_tokens(args.max_context_tokens)
                 .max_turns(args.max_turns)
-                .store_factory(Arc::new(
-                    lash::persistence::InMemorySessionStoreFactory::new(),
-                ))
-                .process_registry(Arc::new(TestLocalProcessRegistry::default()))
-                .process_env_store(Arc::new(
-                    lash::persistence::InMemoryProcessExecutionEnvStore::new(),
-                ))
                 .plugins(build_standard_plugin_stack(
                     standard_context_approach.cloned(),
-                ))
-                .effect_host(Arc::new(lash::durability::InlineEffectHost::default()))
-                .attachment_store(Arc::new(lash::persistence::InMemoryAttachmentStore::new()));
-            builder = builder.trace_jsonl_path(trace_path.clone());
+                ));
+            builder = builder.trace_jsonl_path(Some(trace_path.clone()));
             let core = builder.build()?;
             let session = core
                 .session("root")
@@ -5721,28 +5675,16 @@ async fn run_task(ctx: RunTaskContext<'_>, task: &WardenTask) -> Result<TaskResu
             .await?
         }
         ExecutionMode::Rlm => {
-            let mut builder = LashCore::rlm_builder(lash::rlm::RlmProtocolPluginFactory::new(
-                lash::rlm::RlmProtocolPluginConfig::default(),
-                Arc::new(lash::persistence::InMemoryLashlangArtifactStore::new()),
-            ))
-            .provider(provider.clone())
-            .model(model_spec)
-            .max_turns(args.max_turns)
-            .store_factory(Arc::new(
-                lash::persistence::InMemorySessionStoreFactory::new(),
-            ))
-            .process_registry(Arc::new(TestLocalProcessRegistry::default()))
-            .process_env_store(Arc::new(
-                lash::persistence::InMemoryProcessExecutionEnvStore::new(),
-            ))
-            .plugins(build_rlm_plugin_stack())
-            .effect_host(Arc::new(lash::durability::InlineEffectHost::default()))
-            .attachment_store(Arc::new(lash::persistence::InMemoryAttachmentStore::new()));
-            builder = builder.trace_jsonl_path(trace_path.clone());
+            let mut builder = LashCore::rlm()
+                .provider(provider.clone())
+                .model(model.to_string(), args.variant.clone())
+                .max_context_tokens(args.max_context_tokens)
+                .max_turns(args.max_turns)
+                .plugins(build_rlm_plugin_stack());
+            builder = builder.trace_jsonl_path(Some(trace_path.clone()));
             let core = builder.build()?;
             let session = core
                 .session("root")
-                .final_answer_format(RlmFinalAnswerFormat::RawFinalValue)?
                 .store(store.clone() as Arc<dyn RuntimePersistence>)
                 .open()
                 .await?;
@@ -5814,7 +5756,7 @@ async fn run_task(ctx: RunTaskContext<'_>, task: &WardenTask) -> Result<TaskResu
         input_tokens: tokens.input,
         output_tokens: tokens.output,
         reasoning_tokens: tokens.reasoning,
-        cache_read_input_tokens: tokens.cache_read,
+        cached_input_tokens: tokens.cache_read,
         cache_creation_input_tokens: tokens.cache_creation,
         non_cache_input_tokens: tokens.non_cache_input,
         provider_total_tokens: tokens.provider_total,
@@ -5893,11 +5835,11 @@ async fn run_turn_on_session_with_schema(
     let before_usage = session.usage_report();
     let mut turn = session.turn(TurnInput::text(prompt.to_string()));
     if let Some(schema) = finish_schema {
-        turn = turn.require_finish_schema(schema)?;
+        turn = turn.require_submit_schema(schema)?;
     }
     let result = turn
         .cancel(cancel)
-        .stream_to(sink)
+        .stream(sink)
         .await
         .context("run Warden Sentry task")?;
     let after_usage = session.usage_report();
@@ -6494,14 +6436,12 @@ fn build_agent_semantic_match_prompt(job: &AgentScoringJob) -> Result<String> {
 fn build_agent_semantic_match_request(args: &Args, model: &str, prompt: String) -> DirectRequest {
     let schema = DirectJsonSchema {
         name: "warden_agent_semantic_match_pass".to_string(),
-        schema: SchemaContract::new(agent_semantic_match_schema()),
+        schema: agent_semantic_match_schema(),
         strict: true,
     };
     let mut request = DirectRequest::json_schema(model.to_string(), prompt, schema);
     request.model_variant = args.variant.clone();
-    request.generation = GenerationOptions {
-        output_token_cap: NonZeroUsize::new(args.score_max_output_tokens),
-    };
+    let _ = args.score_max_output_tokens;
     request
 }
 
@@ -6582,7 +6522,7 @@ fn merge_scoring_usage(totals: &mut ScoringUsageTotals, other: &ScoringUsageTota
     totals.input_tokens += other.input_tokens;
     totals.output_tokens += other.output_tokens;
     totals.reasoning_tokens += other.reasoning_tokens;
-    totals.cache_read_input_tokens += other.cache_read_input_tokens;
+    totals.cached_input_tokens += other.cached_input_tokens;
     totals.cache_creation_input_tokens += other.cache_creation_input_tokens;
     totals.cache_creation_5m_input_tokens += other.cache_creation_5m_input_tokens;
     totals.cache_creation_1h_input_tokens += other.cache_creation_1h_input_tokens;
@@ -6898,7 +6838,8 @@ fn build_rlm_plugin_stack() -> PluginStack {
 }
 
 fn warden_read_only_repo_tool_stack() -> PluginStack {
-    let mut stack = locked_down_rlm_plugin_stack();
+    let mut stack = PluginStack::runtime();
+    stack.push(Arc::new(ToolDiscoveryPluginFactory::new()));
     push_read_only_repo_tools(&mut stack);
     stack
 }
@@ -6912,25 +6853,22 @@ fn push_standard_context_tools(
             stack.push(Arc::new(RollingHistoryPluginFactory::new(config)));
         }
         Some(StandardContextApproach::ObservationalMemory(config)) => {
-            stack.push(Arc::new(ObservationalMemoryPluginFactory::new(config)));
+            let _ = config;
+            stack.push(Arc::new(ObservationalMemoryPluginFactory));
         }
         None => {}
     }
 }
 
 fn push_read_only_repo_tools(stack: &mut PluginStack) {
-    stack.push(Arc::new(StaticPluginFactory::new(
-        "read_file",
-        PluginSpec::new()
-            .with_tool_provider(Arc::new(read_file_provider()) as Arc<dyn ToolProvider>),
-    )));
+    stack.push(Arc::new(ReadFilePluginFactory::new()));
     stack.push(Arc::new(StaticPluginFactory::new(
         "glob",
-        PluginSpec::new().with_tool_provider(Arc::new(glob_provider()) as Arc<dyn ToolProvider>),
+        PluginSpec::new().with_tool_provider(Arc::new(Glob) as Arc<dyn ToolProvider>),
     )));
     stack.push(Arc::new(StaticPluginFactory::new(
         "grep",
-        PluginSpec::new().with_tool_provider(Arc::new(grep_provider()) as Arc<dyn ToolProvider>),
+        PluginSpec::new().with_tool_provider(Arc::new(Grep::new()) as Arc<dyn ToolProvider>),
     )));
 }
 
@@ -6985,13 +6923,13 @@ fn standard_context_approach_label(approach: &StandardContextApproach) -> &'stat
 fn turn_completed(outcome: &TurnOutcome) -> bool {
     matches!(
         outcome,
-        TurnOutcome::Finished(_) | TurnOutcome::AgentFrameSwitch { .. }
+        TurnOutcome::Finished(_) | TurnOutcome::Handoff { .. }
     )
 }
 
 fn turn_status_label(outcome: &TurnOutcome) -> &'static str {
     match outcome {
-        TurnOutcome::Finished(_) | TurnOutcome::AgentFrameSwitch { .. } => "completed",
+        TurnOutcome::Finished(_) | TurnOutcome::Handoff { .. } => "completed",
         TurnOutcome::Stopped(TurnStop::Cancelled) => "interrupted",
         TurnOutcome::Stopped(_) => "failed",
     }
@@ -7000,9 +6938,9 @@ fn turn_status_label(outcome: &TurnOutcome) -> &'static str {
 fn done_reason_label(outcome: &TurnOutcome) -> &'static str {
     match outcome {
         TurnOutcome::Finished(TurnFinish::AssistantMessage { .. }) => "assistant_message",
-        TurnOutcome::Finished(TurnFinish::FinalValue { .. }) => "final_value",
+        TurnOutcome::Finished(TurnFinish::SubmittedValue { .. }) => "submitted_value",
         TurnOutcome::Finished(TurnFinish::ToolValue { .. }) => "tool_value",
-        TurnOutcome::AgentFrameSwitch { .. } => "agent_frame_switch",
+        TurnOutcome::Handoff { .. } => "handoff",
         TurnOutcome::Stopped(TurnStop::Cancelled) => "cancelled",
         TurnOutcome::Stopped(TurnStop::Incomplete) => "incomplete",
         TurnOutcome::Stopped(TurnStop::InvalidInput) => "invalid_input",
@@ -7018,7 +6956,7 @@ fn done_reason_label(outcome: &TurnOutcome) -> &'static str {
 
 fn terminal_json_value(outcome: &TurnOutcome) -> Option<serde_json::Value> {
     match outcome {
-        TurnOutcome::Finished(TurnFinish::FinalValue { value })
+        TurnOutcome::Finished(TurnFinish::SubmittedValue { value })
         | TurnOutcome::Finished(TurnFinish::ToolValue { value, .. }) => Some(value.clone()),
         _ => None,
     }
@@ -7029,8 +6967,8 @@ fn aggregate_usage(report: &SessionUsageReport) -> TokenTotals {
     for row in &report.by_source_model {
         out.input += row.usage.input_tokens.max(0) as u64;
         out.output += row.usage.output_tokens.max(0) as u64;
-        out.cache_read += row.usage.cache_read_input_tokens.max(0) as u64;
-        out.reasoning += row.usage.reasoning_output_tokens.max(0) as u64;
+        out.cache_read += row.usage.cached_input_tokens.max(0) as u64;
+        out.reasoning += row.usage.reasoning_tokens.max(0) as u64;
     }
     out.cache = out.cache_read;
     out.non_cache_input = out.input.saturating_sub(out.cache_read);
@@ -7483,8 +7421,8 @@ fn normalize_task_result(row: &mut TaskResult) {
     if row.reasoning_tokens == 0 {
         row.reasoning_tokens = row.tokens.reasoning;
     }
-    if row.cache_read_input_tokens == 0 {
-        row.cache_read_input_tokens = row.tokens.cache_read;
+    if row.cached_input_tokens == 0 {
+        row.cached_input_tokens = row.tokens.cache_read;
     }
     if row.cache_creation_input_tokens == 0 {
         row.cache_creation_input_tokens = row.tokens.cache_creation;
@@ -7843,7 +7781,7 @@ fn run_summary_value(
                 "inputTokens": result.input_tokens,
                 "outputTokens": result.output_tokens,
                 "reasoningTokens": result.reasoning_tokens,
-                "cacheReadInputTokens": result.cache_read_input_tokens,
+                "cacheReadInputTokens": result.cached_input_tokens,
                 "cacheCreationInputTokens": result.cache_creation_input_tokens,
                 "nonCacheInputTokens": result.non_cache_input_tokens,
                 "providerTotalTokens": result.provider_total_tokens,
@@ -8111,8 +8049,8 @@ impl InstanceEventSink {
             let mut totals = self.live_usage.lock().unwrap_or_else(|e| e.into_inner());
             totals.input += usage.input_tokens.max(0) as u64;
             totals.output += usage.output_tokens.max(0) as u64;
-            totals.cache_read += usage.cache_read_input_tokens.max(0) as u64;
-            totals.reasoning += usage.reasoning_output_tokens.max(0) as u64;
+            totals.cache_read += usage.cached_input_tokens.max(0) as u64;
+            totals.reasoning += usage.reasoning_tokens.max(0) as u64;
             totals.cache = totals.cache_read;
             totals.non_cache_input = totals.input.saturating_sub(totals.cache_read);
             totals.provider_total = totals.input + totals.output;
@@ -8140,10 +8078,10 @@ impl InstanceEventSink {
 impl TurnActivitySink for InstanceEventSink {
     async fn emit(&self, activity: TurnActivity) {
         match &activity.event {
-            TurnEvent::ModelRequestStarted { protocol_iteration } => {
+            TurnEvent::ModelRequestStarted { mode_iteration } => {
                 self.flush_current_response();
                 if let Ok(mut s) = self.iterations.lock() {
-                    s.insert(*protocol_iteration);
+                    s.insert(*mode_iteration);
                 }
                 if let Ok(mut count) = self.llm_response_count.lock() {
                     *count += 1;
@@ -8182,17 +8120,26 @@ mod tests {
     use super::*;
 
     fn tool_names_for_stack(stack: PluginStack) -> Vec<String> {
-        let mut factories = stack.into_factories();
-        factories.extend(lash_core::testing::test_standard_protocol_factories());
-        let host = lash_core::PluginHost::new(factories);
+        let host = lash_core::PluginHost::new(stack.into_factories());
         let session_id = "test".to_string();
-        let session = host.build_session(session_id.clone(), None).unwrap();
+        let mode = lash_core::ExecutionMode::standard();
+        let session = host
+            .build_session(
+                session_id.clone(),
+                mode.clone(),
+                Some(StandardContextApproach::default()),
+                None,
+            )
+            .unwrap();
         session
-            .resolved_tool_catalog(&session_id)
-            .unwrap()
-            .tool_names()
-            .as_ref()
-            .clone()
+            .tool_catalog(&session_id, mode)
+            .into_iter()
+            .filter_map(|tool| {
+                tool.get("name")
+                    .and_then(|name| name.as_str())
+                    .map(str::to_string)
+            })
+            .collect()
     }
 
     fn sample_result() -> TaskResult {
@@ -8392,18 +8339,16 @@ console.log(JSON.stringify({executed:true, finalFindings: merged, events}));
         sink.record_usage(&TokenUsage {
             input_tokens: 90,
             output_tokens: 9,
-            cache_read_input_tokens: 0,
-            cache_write_input_tokens: 0,
-            reasoning_output_tokens: 1000,
+            cached_input_tokens: 0,
+            reasoning_tokens: 1000,
         });
         assert!(!cancel.is_cancelled());
 
         sink.record_usage(&TokenUsage {
             input_tokens: 2,
             output_tokens: 0,
-            cache_read_input_tokens: 0,
-            cache_write_input_tokens: 0,
-            reasoning_output_tokens: 0,
+            cached_input_tokens: 0,
+            reasoning_tokens: 0,
         });
         assert!(cancel.is_cancelled());
         assert!(

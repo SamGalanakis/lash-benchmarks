@@ -393,8 +393,10 @@ class LashSystem(ContinualLearningSystem):
                     provider=self._usage_provider(),
                     input_tokens=usage.get("input_tokens"),
                     output_tokens=usage.get("output_tokens"),
-                    reasoning_tokens=usage.get("reasoning_output_tokens"),
-                    cached_input_tokens=usage.get("cache_read_input_tokens"),
+                    reasoning_tokens=usage.get("reasoning_tokens")
+                    or usage.get("reasoning_output_tokens"),
+                    cached_input_tokens=usage.get("cached_input_tokens")
+                    or usage.get("cache_read_input_tokens"),
                     call_type="completion",
                     raw_usage=usage,
                     metadata={

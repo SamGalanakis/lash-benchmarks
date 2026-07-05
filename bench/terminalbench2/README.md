@@ -108,7 +108,10 @@ Reuse is deliberately conservative:
 - **Structured results**: `.benchmarks/terminalbench2/runs/<timestamp>__<job-name>/` — gathered trial JSONs + run summary.
 - **JSONL run artifacts**: `trials.jsonl` has one full structured record per trial; `task_logs.jsonl` concatenates per-task durable log-sink records.
 - **Per-trial log sink**: each trial has `artifacts/log_sink.jsonl`, preserving copied JSON/JSONL records and text log lines with task/trial/source metadata.
+- **Artifact completeness**: each trial records `artifacts.completeness` checks for Lash session DBs, traces, exported transcript JSON, turn usage, agent stdout/stderr, and verifier logs. Run and task summaries aggregate missing required artifacts.
+- **Image parity**: each trial records `metadata.image_parity` with upstream task image, actual image when Harbor exposes it, `force_build`, and whether Harbor used a prebuilt image or local build.
 - **Lash traces**: exported under each trial's `artifacts/sessions/*.trace.jsonl` when the lash agent runs; dashboard LLM-call counts come from typed `llm_call_completed` trace records.
+- **Scoring and cost**: official Terminal-Bench score/status comes only from Harbor verifier reward. `agent_cost_usd` is the leaderboard cost field and is an alias of Harbor `agent_result.cost_usd`; verifier/export/dashboard/auxiliary-analysis costs are not folded into it.
 
 ## Implementation notes
 

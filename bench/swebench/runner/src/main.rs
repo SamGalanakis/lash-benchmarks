@@ -14,19 +14,31 @@ use chrono::Utc;
 use clap::Parser;
 use dataset::{SweBenchInstance, load_instances};
 use lash::{
-    LashCore, LashSession, ModelSpec, PluginStack, SessionSpec, TurnActivity, TurnActivitySink,
-    TurnEvent, TurnInput,
-    persistence::RuntimePersistence,
+    SessionSpec, TurnInput,
+    advanced::{EventSink, ExecutionMode, TurnContext, TurnFinish, TurnOutcome, TurnStop},
+    plugins::{
+        BuiltinMonitorToolPluginFactory, BuiltinTaskControlsPluginFactory, PluginFactory,
+        PluginSession,
+    },
     provider::ProviderHandle,
     usage::{SessionUsageReport, diff_usage_reports},
 };
-use lash_core::{TestLocalProcessRegistry, TurnFinish, TurnOutcome, TurnStop};
-use lash_llm_tools::LlmToolsPluginFactory;
-use lash_sqlite_store::Store;
-use lash_standard_plugins::{
-    StandardContextApproach, StandardToolStackOptions, standard_tool_stack,
+use lash_cli::config::LashConfig;
+use lash_core::{
+    BackgroundRuntimeHost, EmbeddedRuntimeHost, InputItem, LashRuntime, LocalBackgroundTaskHost,
+    PersistedSessionState, PersistentRuntimeServices, PluginHost, RuntimeCoreConfig,
+    RuntimePersistence, SessionEvent, SessionPolicy, StandardContextApproach,
+    ToolOutputBudgetPluginFactory, TurnInjectionBridge, TurnInputInjectionBridge,
 };
-use lash_subagents::{CapabilityRegistry, StaticCapability, SubagentsPluginFactory};
+use lash_llm_tools::LlmToolsPluginFactory;
+use lash_plugin_observational_memory::ObservationalMemoryPluginFactory;
+use lash_plugin_rolling_history::RollingHistoryPluginFactory;
+use lash_sqlite_store::Store;
+use lash_standard_plugins::{DefaultPluginStackOptions, DefaultToolBundle, default_plugin_stack};
+use lash_subagents::{
+    CapabilityRegistry, LocalSubagentHost, SubagentHost, SubagentsPluginFactory, TierCapability,
+    TierExecutionMode,
+};
 use serde::{Deserialize, Serialize};
 use tokio::sync::Semaphore;
 use tokio::task::JoinSet;
@@ -52,21 +64,6 @@ const TASK_PREAMBLE: &str = concat!(
     "4. Do NOT add, modify, or look at test files — the grader ships its own tests and runs them against your diff.\n",
     "5. Stop once the fix is in place. `git diff HEAD` in the project root will be captured as your submitted patch, so do not commit, push, or run `git reset`.\n",
 );
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum ExecutionMode {
-    Standard,
-    Rlm,
-}
-
-impl ExecutionMode {
-    fn as_str(self) -> &'static str {
-        match self {
-            Self::Standard => "standard",
-            Self::Rlm => "rlm",
-        }
-    }
-}
 
 #[derive(Parser, Debug, Clone)]
 #[command(name = "bench-swebench")]
@@ -621,75 +618,53 @@ async fn run_instance(
     let trace_path = instance_dir.join("session.trace.jsonl");
     let events_path = instance_dir.join("events.jsonl");
     let store = Arc::new(
-        Store::open(&store_path)
-            .await
-            .with_context(|| format!("open {}", store_path.display()))?,
+        Store::open(&store_path).with_context(|| format!("open {}", store_path.display()))?,
     );
 
-    let model_spec = ModelSpec::from_token_limits(
-        model.to_string(),
-        Some(args.variant.clone()),
-        args.max_context_tokens,
-        None,
-    )
-    .map_err(anyhow::Error::msg)?;
-    let session: LashSession = match execution_mode {
-        ExecutionMode::Standard => {
-            let core = LashCore::standard_builder()
-                .provider(provider.clone())
-                .model(model_spec)
-                .max_turns(args.max_turns)
-                .trace_jsonl_path(trace_path.clone())
-                .store_factory(Arc::new(
-                    lash::persistence::InMemorySessionStoreFactory::new(),
-                ))
-                .process_registry(Arc::new(TestLocalProcessRegistry::default()))
-                .process_env_store(Arc::new(
-                    lash::persistence::InMemoryProcessExecutionEnvStore::new(),
-                ))
-                .effect_host(Arc::new(lash::durability::InlineEffectHost::default()))
-                .attachment_store(Arc::new(lash::persistence::InMemoryAttachmentStore::new()))
-                .plugins(build_standard_plugin_stack(
-                    standard_context_approach.cloned(),
-                ))
-                .build()?;
-            core.session("root")
-                .store(store.clone() as Arc<dyn RuntimePersistence>)
-                .open()
-                .await?
-        }
-        ExecutionMode::Rlm => {
-            let core = LashCore::rlm_builder(lash::rlm::RlmProtocolPluginFactory::new(
-                lash::rlm::RlmProtocolPluginConfig::default(),
-                Arc::new(lash::persistence::InMemoryLashlangArtifactStore::new()),
-            ))
-            .provider(provider.clone())
-            .model(model_spec)
-            .max_turns(args.max_turns)
-            .trace_jsonl_path(trace_path.clone())
-            .store_factory(Arc::new(
-                lash::persistence::InMemorySessionStoreFactory::new(),
-            ))
-            .process_registry(Arc::new(TestLocalProcessRegistry::default()))
-            .process_env_store(Arc::new(
-                lash::persistence::InMemoryProcessExecutionEnvStore::new(),
-            ))
-            .effect_host(Arc::new(lash::durability::InlineEffectHost::default()))
-            .attachment_store(Arc::new(lash::persistence::InMemoryAttachmentStore::new()))
-            .plugins(build_rlm_plugin_stack())
-            .build()?;
-            core.session("root")
-                .store(store.clone() as Arc<dyn RuntimePersistence>)
-                .open()
-                .await?
-        }
+    let policy = SessionPolicy {
+        model: model.to_string(),
+        provider: provider.clone(),
+        max_context_tokens: Some(args.max_context_tokens),
+        execution_mode: execution_mode.clone(),
+        standard_context_approach: standard_context_approach.cloned(),
+        model_variant: Some(args.variant.clone()),
+        max_turns: Some(args.max_turns),
+        ..SessionPolicy::default()
     };
+    let plugin_session = build_plugin_session(
+        execution_mode.clone(),
+        standard_context_approach.cloned(),
+        &policy,
+    )?;
+    let services = PersistentRuntimeServices::new_with_bridges(
+        plugin_session,
+        TurnInjectionBridge::new(),
+        TurnInputInjectionBridge::new(),
+        store.clone() as Arc<dyn RuntimePersistence>,
+    );
+    let host = BackgroundRuntimeHost::new(
+        EmbeddedRuntimeHost::new(
+            RuntimeCoreConfig::default().with_trace_jsonl_path(Some(trace_path.clone())),
+        ),
+        Arc::new(LocalBackgroundTaskHost::default()),
+    );
+    let mut runtime = LashRuntime::from_persistent_background_state(
+        policy.clone(),
+        host,
+        services,
+        PersistedSessionState {
+            session_id: "root".to_string(),
+            policy,
+            ..PersistedSessionState::default()
+        },
+    )
+    .await?;
 
     let sink = Arc::new(InstanceEventSink::new(events_path.clone())?);
-    let sink_trait: Arc<dyn TurnActivitySink> = sink.clone();
+    let sink_trait: Arc<dyn EventSink> = sink.clone();
     let cancel = tokio_util::sync::CancellationToken::new();
 
-    let before_usage = session.usage_report();
+    let before_usage = runtime.usage_report();
     let turn_started = Instant::now();
     // Each instance runs in its own subprocess (see `spawn_child`), so we
     // own the process CWD for the duration of this turn. Lash core does not
@@ -697,16 +672,25 @@ async fn run_instance(
     // CWD, so this pins them to the instance's worktree.
     std::env::set_current_dir(&repo_dir)
         .with_context(|| format!("cd into {}", repo_dir.display()))?;
-    let turn = session
-        .turn(TurnInput::text(prompt))
-        .cancel(cancel)
-        .stream_to(sink_trait.as_ref())
+    let turn = runtime
+        .stream_turn(
+            TurnInput {
+                items: vec![InputItem::Text { text: prompt }],
+                image_blobs: Default::default(),
+                mode_turn_options: None,
+                trace_turn_id: None,
+                mode_extension: None,
+                turn_context: TurnContext::default(),
+            },
+            sink_trait.as_ref(),
+            cancel,
+        )
         .await
         .context("run swebench instance")?;
     let model_patch = capture_git_diff(&repo_dir)
         .with_context(|| format!("capture diff for {}", instance.instance_id))?;
     let turn_seconds = turn_started.elapsed().as_secs_f64();
-    let after_usage = session.usage_report();
+    let after_usage = runtime.usage_report();
     let usage = diff_usage_reports(&before_usage, &after_usage)
         .map(|rows| SessionUsageReport::from_entries(&rows))
         .map_err(anyhow::Error::msg)
@@ -786,13 +770,13 @@ async fn run_instance(
 fn turn_completed(outcome: &TurnOutcome) -> bool {
     matches!(
         outcome,
-        TurnOutcome::Finished(_) | TurnOutcome::AgentFrameSwitch { .. }
+        TurnOutcome::Finished(_) | TurnOutcome::Handoff { .. }
     )
 }
 
 fn turn_status_label(outcome: &TurnOutcome) -> &'static str {
     match outcome {
-        TurnOutcome::Finished(_) | TurnOutcome::AgentFrameSwitch { .. } => "completed",
+        TurnOutcome::Finished(_) | TurnOutcome::Handoff { .. } => "completed",
         TurnOutcome::Stopped(TurnStop::Cancelled) => "interrupted",
         TurnOutcome::Stopped(_) => "failed",
     }
@@ -801,9 +785,9 @@ fn turn_status_label(outcome: &TurnOutcome) -> &'static str {
 fn done_reason_label(outcome: &TurnOutcome) -> &'static str {
     match outcome {
         TurnOutcome::Finished(TurnFinish::AssistantMessage { .. }) => "assistant_message",
-        TurnOutcome::Finished(TurnFinish::FinalValue { .. }) => "submitted_value",
+        TurnOutcome::Finished(TurnFinish::SubmittedValue { .. }) => "submitted_value",
         TurnOutcome::Finished(TurnFinish::ToolValue { .. }) => "tool_value",
-        TurnOutcome::AgentFrameSwitch { .. } => "agent_frame_switch",
+        TurnOutcome::Handoff { .. } => "handoff",
         TurnOutcome::Stopped(TurnStop::Cancelled) => "cancelled",
         TurnOutcome::Stopped(TurnStop::Incomplete) => "incomplete",
         TurnOutcome::Stopped(TurnStop::InvalidInput) => "invalid_input",
@@ -961,51 +945,98 @@ fn capture_git_diff(repo_dir: &Path) -> Result<String> {
     Ok(String::from_utf8_lossy(&output.stdout).to_string())
 }
 
-fn build_standard_plugin_stack(
+fn build_plugin_session(
+    execution_mode: ExecutionMode,
     standard_context_approach: Option<StandardContextApproach>,
-) -> PluginStack {
-    let mut stack = standard_tool_stack(StandardToolStackOptions {
-        standard_context_approach,
-        tavily_api_key: None,
-        include_cancel_process: true,
-    });
-    stack.push(Arc::new(LlmToolsPluginFactory::default()));
-    stack.push(Arc::new(subagents_factory()));
-    stack
-}
+    _policy: &SessionPolicy,
+) -> Result<Arc<PluginSession>> {
+    let mut factories: Vec<Arc<dyn PluginFactory>> =
+        vec![Arc::new(ToolOutputBudgetPluginFactory::default())];
+    if let Some(standard_context_approach) = &standard_context_approach {
+        match standard_context_approach {
+            StandardContextApproach::RollingHistory(_) => {
+                factories.push(Arc::new(RollingHistoryPluginFactory::default()));
+            }
+            StandardContextApproach::ObservationalMemory(_) => {
+                factories.push(Arc::new(ObservationalMemoryPluginFactory));
+            }
+        }
+    }
+    factories.push(Arc::new(BuiltinTaskControlsPluginFactory::new()));
+    factories.push(Arc::new(BuiltinMonitorToolPluginFactory::new()));
+    factories.push(Arc::new(
+        lash_mode_standard::BuiltinStandardModePluginFactory,
+    ));
+    factories.push(Arc::new(
+        lash_mode_rlm::BuiltinRlmModePluginFactory::default(),
+    ));
 
-fn build_rlm_plugin_stack() -> PluginStack {
-    let mut stack = standard_tool_stack(StandardToolStackOptions {
-        standard_context_approach: None,
+    // Tool bundles only — core/context/mode plugins are registered
+    // above, so we ask `default_plugin_stack` for just the tool
+    // surfaces (shell, apply_patch, read/ls/grep/glob). No `ask`
+    // (autonomous run) and no web tools.
+    let mut tool_factories = default_plugin_stack(DefaultPluginStackOptions {
+        execution_mode: execution_mode.clone(),
+        standard_context_approach: standard_context_approach.clone(),
+        bundles: vec![
+            DefaultToolBundle::Shell,
+            DefaultToolBundle::Editing,
+            DefaultToolBundle::Files,
+            DefaultToolBundle::Search,
+        ],
         tavily_api_key: None,
-        include_cancel_process: true,
-    });
-    stack.push(Arc::new(LlmToolsPluginFactory::default()));
-    stack.push(Arc::new(subagents_factory()));
-    stack
-}
+    })
+    .into_factories();
+    factories.append(&mut tool_factories);
 
-fn subagents_factory() -> SubagentsPluginFactory {
-    SubagentsPluginFactory::new(Arc::new(CapabilityRegistry::new().with(Arc::new(
-        StaticCapability::new("default", SessionSpec::inherit()),
-    ))))
-    .with_session_spec(SessionSpec::inherit())
+    let registry = Arc::new(CapabilityRegistry::new().with(Arc::new(TierCapability::new(
+        "default",
+        None,
+        TierExecutionMode::Inherit,
+    ))));
+    let subagent_host: Arc<dyn SubagentHost> = Arc::new(LocalSubagentHost::default());
+    factories.push(Arc::new(LlmToolsPluginFactory::default()));
+    factories.push(Arc::new(
+        SubagentsPluginFactory::new(registry, subagent_host)
+            .with_session_spec(SessionSpec::inherit()),
+    ));
+
+    let plugin_host = PluginHost::new(factories);
+    plugin_host
+        .build_session("root", execution_mode, standard_context_approach, None)
+        .context("build plugin session")
 }
 
 fn resolve_provider(args: &Args) -> Result<(ProviderHandle, String, String)> {
-    let provider = bench_common::load_provider(args.provider_id.as_deref())?;
+    lash_providers_builtin::register_all();
+    let config_path = std::env::var("LASH_HOME")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|_| {
+            dirs::home_dir()
+                .unwrap_or_else(|| std::path::PathBuf::from("."))
+                .join(".lash")
+        })
+        .join("config.json");
+    let config = LashConfig::load(&config_path).ok_or_else(|| {
+        anyhow::anyhow!(
+            "~/.lash/config.json not found or invalid — set up a provider with `lash --provider` or re-login"
+        )
+    })?;
+    let provider = config
+        .build_active_provider()
+        .map_err(|err| anyhow::anyhow!(err))?;
     let kind = provider.kind().to_string();
     let model = args
         .model
         .clone()
-        .unwrap_or_else(|| bench_common::default_model_for_provider(provider.kind()).to_string());
+        .unwrap_or_else(|| provider.default_model().to_string());
     Ok((provider, kind, model))
 }
 
 fn parse_execution_mode(raw: &str) -> Result<ExecutionMode> {
     match raw {
-        "rlm" => Ok(ExecutionMode::Rlm),
-        "standard" => Ok(ExecutionMode::Standard),
+        "rlm" => Ok(ExecutionMode::new("rlm")),
+        "standard" => Ok(ExecutionMode::standard()),
         other => bail!("unsupported execution mode `{other}`"),
     }
 }
@@ -1024,7 +1055,7 @@ fn resolve_standard_context_approach(
     execution_mode: &ExecutionMode,
     raw: Option<&str>,
 ) -> Result<Option<StandardContextApproach>> {
-    if *execution_mode == ExecutionMode::Standard {
+    if *execution_mode == ExecutionMode::standard() {
         return parse_standard_context_approach(raw.unwrap_or(DEFAULT_CONTEXT_APPROACH)).map(Some);
     }
     if raw.is_some() {
@@ -1034,7 +1065,7 @@ fn resolve_standard_context_approach(
 }
 
 fn execution_mode_label(mode: &ExecutionMode) -> &str {
-    mode.as_str()
+    mode.plugin_id()
 }
 
 fn standard_context_approach_label(approach: &StandardContextApproach) -> &'static str {
@@ -1058,8 +1089,8 @@ fn aggregate_usage(report: &SessionUsageReport) -> TokenTotals {
     for row in &report.by_source_model {
         out.input += row.usage.input_tokens.max(0) as u64;
         out.output += row.usage.output_tokens.max(0) as u64;
-        out.cache += row.usage.cache_read_input_tokens.max(0) as u64;
-        out.reasoning += row.usage.reasoning_output_tokens.max(0) as u64;
+        out.cache += row.usage.cached_input_tokens.max(0) as u64;
+        out.reasoning += row.usage.reasoning_tokens.max(0) as u64;
     }
     out
 }
@@ -1146,36 +1177,35 @@ impl InstanceEventSink {
 }
 
 #[async_trait::async_trait]
-impl TurnActivitySink for InstanceEventSink {
-    async fn emit(&self, activity: TurnActivity) {
-        match &activity.event {
-            TurnEvent::ModelRequestStarted { protocol_iteration } => {
+impl EventSink for InstanceEventSink {
+    async fn emit(&self, event: SessionEvent) {
+        match &event {
+            SessionEvent::LlmRequest { mode_iteration, .. } => {
                 if let Ok(mut s) = self.iterations.lock() {
-                    s.insert(*protocol_iteration);
+                    s.insert(*mode_iteration);
                 }
             }
-            TurnEvent::AssistantProseDelta { text } => {
+            SessionEvent::LlmResponse { content, .. } => {
                 if let Ok(mut last) = self.last_llm_response.lock() {
-                    let response = last.get_or_insert_with(String::new);
-                    response.push_str(text);
+                    *last = Some(content.trim().to_string());
                 }
                 if let Ok(mut count) = self.llm_response_count.lock() {
                     *count += 1;
                 }
             }
-            TurnEvent::Error { message } => {
+            SessionEvent::Error { message, .. } => {
                 if let Ok(mut last) = self.last_error.lock() {
                     *last = Some(message.clone());
                 }
             }
-            TurnEvent::ToolCallCompleted { name, .. } => {
+            SessionEvent::ToolCall { name, .. } => {
                 if let Ok(mut map) = self.tool_breakdown.lock() {
                     *map.entry(name.clone()).or_insert(0) += 1;
                 }
             }
             _ => {}
         }
-        if let Ok(line) = serde_json::to_string(&activity)
+        if let Ok(line) = serde_json::to_string(&event)
             && let Ok(mut file) = self.file.lock()
         {
             let _ = writeln!(file, "{line}");

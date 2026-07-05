@@ -1,39 +1,44 @@
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use anyhow::{Context, Result, bail};
+use async_trait::async_trait;
 use clap::Parser;
-use lash::rlm::RlmTurnBuilderExt;
 use lash::{
-    LashCore, ModelSpec, PluginStack, SessionSpec, TurnInput,
-    persistence::{
-        ProtocolEvent, RuntimePersistence, RuntimeSessionState, load_persisted_session_state,
+    SessionSpec, TurnInput,
+    advanced::{
+        EventSink, ExecutionMode, ModeTurnOptions, TurnContext, TurnFinish, TurnOutcome, TurnStop,
     },
-    prompt::{
-        PromptBuiltin, PromptSlot, PromptTemplate, PromptTemplateEntry, PromptTemplateSection,
-    },
+    plugins::{PluginFactory, PluginSession, PluginSpec, StaticPluginFactory},
     provider::ProviderHandle,
-    tools::ToolDefinition,
-    usage::{SessionUsageReport, diff_usage_reports},
+    tools::{
+        ToolCall, ToolContract, ToolDefinition, ToolExecutionMode, ToolManifest, ToolProvider,
+        ToolResult,
+    },
+    usage::{SessionUsageReport, TokenLedgerEntry},
 };
-use lash_core::{TestLocalProcessRegistry, TurnFinish, TurnOutcome, TurnStop};
+use lash_cli::config::LashConfig;
+use lash_core::{
+    AppendSessionNodesRequest, BackgroundRuntimeHost, EmbeddedRuntimeHost, FollowedTurn, InputItem,
+    LashRuntime, LocalBackgroundTaskHost, NoopEventSink, PersistedSessionState,
+    PersistentRuntimeServices, PluginHost, RuntimeCoreConfig, RuntimePersistence,
+    SessionAppendNode, SessionEventRecord, SessionPolicy, StandardContextApproach,
+    ToolOutputBudgetPluginFactory, TurnInjectionBridge, TurnInputInjectionBridge,
+};
+use lash_harness_opt::clbench::CLBENCH_MEMORY_GUIDANCE;
 use lash_llm_tools::LlmToolsPluginFactory;
-use lash_plugin_process_controls::SessionProcessAdminPluginFactory;
-use lash_protocol_rlm::RlmTurnInputExt;
-use lash_rlm_types::RlmProtocolEvent;
+use lash_mode_rlm::RlmTurnInputExt;
+use lash_rlm_types::{RlmGlobalsPatchPluginBody, RlmModeEvent, RlmTermination};
 use lash_sqlite_store::Store;
-use lash_subagents::{CapabilityRegistry, StaticCapability, SubagentsPluginFactory};
+use lash_subagents::{
+    CapabilityRegistry, LocalSubagentHost, StaticCapability, SubagentHost, SubagentsPluginFactory,
+};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 const DEFAULT_MAX_CONTEXT_TOKENS: usize = 1_000_000;
 const DEFAULT_MAX_TURNS: usize = 30;
-const CLBENCH_MEMORY_GUIDANCE: &str = concat!(
-    "You are solving a continual-learning benchmark across repeated queries. ",
-    "Use projected variables such as `diary`, `iteration`, `current_query`, and `current_feedback` ",
-    "to preserve useful lessons between turns. Submit only the next action matching the requested schema."
-);
 
 #[derive(Parser, Debug)]
 #[command(name = "bench-clbench-lash")]
@@ -72,6 +77,7 @@ struct RunnerResponse {
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    lash_providers_builtin::register_all();
     let args = Args::parse();
     let request: RunnerRequest = serde_json::from_str(
         &fs::read_to_string(&args.request)
@@ -95,77 +101,100 @@ async fn run_query(request: RunnerRequest) -> Result<RunnerResponse> {
     }
 
     let provider = resolve_provider(request.provider_id.as_deref())?;
-    let model_spec = ModelSpec::from_token_limits(
-        request.model.clone(),
-        request.variant.clone(),
-        request
-            .max_context_tokens
-            .unwrap_or(DEFAULT_MAX_CONTEXT_TOKENS),
-        None,
-    )
-    .map_err(anyhow::Error::msg)?;
-    let mut core_builder = LashCore::rlm_builder(lash::rlm::RlmProtocolPluginFactory::new(
-        clbench_rlm_config(),
-        Arc::new(lash::persistence::InMemoryLashlangArtifactStore::new()),
-    ))
-    .provider(provider)
-    .model(model_spec)
-    .max_turns(request.max_turns.unwrap_or(DEFAULT_MAX_TURNS))
-    .store_factory(Arc::new(
-        lash::persistence::InMemorySessionStoreFactory::new(),
-    ))
-    .process_registry(Arc::new(TestLocalProcessRegistry::default()))
-    .process_env_store(Arc::new(
-        lash::persistence::InMemoryProcessExecutionEnvStore::new(),
-    ))
-    .effect_host(Arc::new(lash::durability::InlineEffectHost::default()))
-    .attachment_store(Arc::new(lash::persistence::InMemoryAttachmentStore::new()))
-    .plugins(build_plugin_stack());
-    if let Some(trace_path) = request.trace_path.clone() {
-        core_builder = core_builder.trace_jsonl_path(trace_path);
-    }
-    let core = core_builder.build()?;
+    let execution_mode = ExecutionMode::new("rlm");
+    let standard_context_approach = None;
+    let policy = SessionPolicy {
+        model: request.model.clone(),
+        provider,
+        model_variant: request.variant.clone(),
+        max_context_tokens: Some(
+            request
+                .max_context_tokens
+                .unwrap_or(DEFAULT_MAX_CONTEXT_TOKENS),
+        ),
+        max_turns: Some(request.max_turns.unwrap_or(DEFAULT_MAX_TURNS)),
+        execution_mode: execution_mode.clone(),
+        standard_context_approach: standard_context_approach.clone(),
+        session_id: Some(request.session_id.clone()),
+        ..SessionPolicy::default()
+    };
 
     let store = Arc::new(
         Store::open(&request.session_db)
-            .await
             .with_context(|| format!("open {}", request.session_db.display()))?,
     );
-    let mut state = load_persisted_session_state(store.as_ref())
+    let plugin_session = build_plugin_session(execution_mode.clone(), &policy)?;
+    let services = PersistentRuntimeServices::new_with_bridges(
+        plugin_session,
+        TurnInjectionBridge::new(),
+        TurnInputInjectionBridge::new(),
+        store.clone() as Arc<dyn RuntimePersistence>,
+    );
+    let host = BackgroundRuntimeHost::new(
+        EmbeddedRuntimeHost::new(
+            RuntimeCoreConfig::default()
+                .with_trace_jsonl_path(request.trace_path.clone())
+                .with_prompt_template(lash_harness_opt::clbench::clbench_prompt_template(
+                    CLBENCH_MEMORY_GUIDANCE,
+                )),
+        ),
+        Arc::new(LocalBackgroundTaskHost::default()),
+    );
+    let state = lash_core::load_persisted_session_state(store.as_ref())
         .await
         .context("load session state")?
-        .unwrap_or_else(|| RuntimeSessionState {
+        .unwrap_or_else(|| PersistedSessionState {
             session_id: request.session_id.clone(),
-            ..RuntimeSessionState::default()
+            policy: policy.clone(),
+            ..PersistedSessionState::default()
         });
-    if let Some(seed) = build_seed_event(&request) {
-        state.session_graph.append_protocol_event(seed);
-    }
-    let session = core
-        .session(request.session_id.clone())
-        .store(store.clone() as Arc<dyn RuntimePersistence>)
-        .open_with_state(state)
+    let mut runtime = LashRuntime::from_persistent_background_state(policy, host, services, state)
         .await
-        .context("open clbench session")?;
+        .context("open runtime")?;
 
-    let mut turn_input = TurnInput::text(clbench_turn_text(&request))
-        .rlm_project(build_projected_bindings(&request)?)?;
-    turn_input.trace_turn_id = Some(format!("clbench-turn-{:04}", request.iteration));
-    let before_usage = session.usage_report();
-    let turn = session
-        .turn(turn_input)
-        .require_finish_schema(request.response_schema.clone())?
-        .prompt_template(clbench_prompt_template(CLBENCH_MEMORY_GUIDANCE))
-        .stream_to(&lash::runtime::NoopTurnActivitySink)
+    if let Some(defaults) = build_globals_patch(&request) {
+        runtime
+            .append_session_nodes(AppendSessionNodesRequest {
+                nodes: vec![SessionAppendNode::event(SessionEventRecord::Mode(
+                    lash_mode_rlm::rlm_mode_event(RlmModeEvent::RlmGlobalsPatch(defaults)),
+                ))],
+                requires_ancestor_node_id: None,
+            })
+            .await
+            .context("bind clbench defaults")?;
+    }
+
+    let sink = NoopEventSink;
+    let followed = runtime
+        .stream_turn_following_handoffs(
+            (TurnInput {
+                items: vec![InputItem::Text {
+                    text: clbench_turn_text(&request),
+                }],
+                image_blobs: Default::default(),
+                mode_turn_options: Some(ModeTurnOptions::typed(
+                    ExecutionMode::new("rlm"),
+                    RlmTermination::SubmitRequired {
+                        schema: Some(request.response_schema.clone()),
+                    },
+                )?),
+                trace_turn_id: Some(format!("clbench-turn-{:04}", request.iteration)),
+                mode_extension: None,
+                turn_context: TurnContext::default(),
+            })
+            .rlm_project(build_projected_bindings(&request)?)?,
+            &sink as &dyn EventSink,
+            tokio_util::sync::CancellationToken::new(),
+        )
         .await
         .context("run clbench turn")?;
-    let usage = diff_usage_reports(&before_usage, &session.usage_report())
-        .map(|rows| SessionUsageReport::from_entries(&rows))
-        .map_err(anyhow::Error::msg)
-        .context("diff usage reports")?;
+    let usage = usage_from_followed_turn(&followed);
+    let turn = followed
+        .final_turn()
+        .context("handoff chain did not produce a turn")?;
 
     let action = match &turn.outcome {
-        TurnOutcome::Finished(TurnFinish::FinalValue { value })
+        TurnOutcome::Finished(TurnFinish::SubmittedValue { value })
         | TurnOutcome::Finished(TurnFinish::ToolValue { value, .. }) => value.clone(),
         other => bail!(
             "turn did not submit an action: status={} reason={} errors={:?} output={}",
@@ -186,10 +215,24 @@ async fn run_query(request: RunnerRequest) -> Result<RunnerResponse> {
             "assistant_output_chars": turn.assistant_output.safe_text.chars().count(),
             "tool_call_count": turn.tool_calls.len(),
             "error_count": turn.errors.len(),
-            "followed_turn_count": 1,
-            "handoff_count": usize::from(matches!(turn.outcome, TurnOutcome::AgentFrameSwitch { .. })),
+            "followed_turn_count": followed.turns.len(),
+            "handoff_count": followed.handoff_count(),
         }),
     })
+}
+
+fn usage_from_followed_turn(followed: &FollowedTurn) -> SessionUsageReport {
+    let entries = followed
+        .turns
+        .iter()
+        .filter(|turn| turn.token_usage.total() != 0 || turn.token_usage.cached_input_tokens != 0)
+        .map(|turn| TokenLedgerEntry {
+            source: "turn".to_string(),
+            model: turn.state.policy.model.clone(),
+            usage: turn.token_usage.clone(),
+        })
+        .collect::<Vec<_>>();
+    SessionUsageReport::from_entries(&entries)
 }
 
 fn clbench_turn_text(request: &RunnerRequest) -> String {
@@ -204,94 +247,117 @@ fn clbench_turn_text(request: &RunnerRequest) -> String {
     text
 }
 
-fn clbench_rlm_config() -> lash_protocol_rlm::RlmProtocolPluginConfig {
-    lash_protocol_rlm::RlmProtocolPluginConfig {
-        prompt_features: lash_protocol_rlm::RlmPromptFeatures {
-            images: false,
-            ..lash_protocol_rlm::RlmPromptFeatures::default()
-        },
-        ..lash_protocol_rlm::RlmProtocolPluginConfig::default()
-    }
-}
-
-fn clbench_prompt_template(memory_guidance: &str) -> PromptTemplate {
-    PromptTemplate::new(vec![
-        PromptTemplateSection::untitled(vec![PromptTemplateEntry::text(
-            "You are being evaluated by Continual Learning Bench, which tests whether an agent improves from feedback across sequential task instances.",
-        )]),
-        PromptTemplateSection::titled(
-            "Execution",
-            vec![
-                PromptTemplateEntry::builtin(PromptBuiltin::ExecutionInstructions),
-                PromptTemplateEntry::slot(PromptSlot::Execution),
-            ],
-        ),
-        PromptTemplateSection::titled(
-            "Continual Memory",
-            vec![PromptTemplateEntry::text(memory_guidance)],
-        ),
-        PromptTemplateSection::titled(
-            "Guidance",
-            vec![
-                PromptTemplateEntry::slot(PromptSlot::Guidance),
-                PromptTemplateEntry::slot(PromptSlot::ProjectInstructions),
-            ],
-        ),
-        PromptTemplateSection::titled(
-            "Environment",
-            vec![
-                PromptTemplateEntry::slot(PromptSlot::RuntimeContext),
-                PromptTemplateEntry::slot(PromptSlot::Environment),
-            ],
-        ),
-    ])
-}
-
-fn build_plugin_stack() -> PluginStack {
+fn build_plugin_session(
+    execution_mode: ExecutionMode,
+    _policy: &SessionPolicy,
+) -> Result<Arc<PluginSession>> {
     let _clbench_tools = clbench_tool_definitions();
-    let mut stack = lash::plugins::runtime_plugin_stack();
-    stack.push(Arc::new(LlmToolsPluginFactory::default()));
-    stack.push(Arc::new(
-        SessionProcessAdminPluginFactory::without_cancel_process(),
-    ));
-    stack.push(Arc::new(
-        SubagentsPluginFactory::new(Arc::new(CapabilityRegistry::new().with(Arc::new(
-            StaticCapability::new("explore", SessionSpec::inherit()),
-        ))))
-        .with_session_spec(SessionSpec::inherit()),
-    ));
-    stack
+    let factories: Vec<Arc<dyn PluginFactory>> = vec![
+        Arc::new(ToolOutputBudgetPluginFactory::default()),
+        Arc::new(lash_mode_rlm::BuiltinRlmModePluginFactory::new(
+            lash_mode_rlm::RlmModePluginConfig {
+                prompt_features: lash_mode_rlm::RlmPromptFeatures {
+                    images: false,
+                    ..lash_mode_rlm::RlmPromptFeatures::default()
+                },
+                ..lash_mode_rlm::RlmModePluginConfig::default()
+            },
+        )),
+        Arc::new(LlmToolsPluginFactory::default()),
+        Arc::new(StaticPluginFactory::new(
+            "clbench_async_handles",
+            PluginSpec::new().with_tool_provider(Arc::new(ClbenchAsyncHandlesTool)),
+        )),
+        Arc::new(
+            SubagentsPluginFactory::new(
+                Arc::new(
+                    CapabilityRegistry::new().with(Arc::new(StaticCapability::new(
+                        "explore",
+                        SessionSpec::inherit(),
+                    ))),
+                ),
+                Arc::new(LocalSubagentHost::default()) as Arc<dyn SubagentHost>,
+            )
+            .with_session_spec(SessionSpec::inherit()),
+        ),
+    ];
+    PluginHost::new(factories)
+        .with_background_tasks()
+        .build_session(
+            "root",
+            execution_mode,
+            None::<StandardContextApproach>,
+            None,
+        )
+        .context("build plugin session")
+}
+
+struct ClbenchAsyncHandlesTool;
+
+#[async_trait]
+impl ToolProvider for ClbenchAsyncHandlesTool {
+    fn tool_manifests(&self) -> Vec<ToolManifest> {
+        vec![list_async_handles_tool_definition().manifest()]
+    }
+
+    fn resolve_contract(&self, name: &str) -> Option<Arc<ToolContract>> {
+        (name == "list_async_handles")
+            .then(|| Arc::new(list_async_handles_tool_definition().contract()))
+    }
+
+    async fn execute(&self, call: ToolCall<'_>) -> ToolResult {
+        ToolResult::err_fmt(format_args!(
+            "`{}` is handled by the RLM session runtime and cannot run directly",
+            call.name
+        ))
+    }
 }
 
 fn clbench_tool_definitions() -> Vec<ToolDefinition> {
     let capabilities = vec!["explore".to_string()];
     vec![
         lash_llm_tools::llm_query_tool_definition(),
-        lash_protocol_rlm::continue_as_tool_definition(),
-        lash_plugin_process_controls::process_list_tool_definition(),
+        lash_mode_rlm::continue_as_tool_definition(),
+        clbench_list_async_handles_tool_definition(),
         lash_subagents::spawn_agent_tool_definition(&capabilities),
     ]
 }
 
-fn build_seed_event(request: &RunnerRequest) -> Option<ProtocolEvent> {
-    let mut globals = serde_json::Map::new();
-    if request.init_diary {
-        globals.insert("diary".to_string(), Value::Array(Vec::new()));
-    }
-    (!globals.is_empty()).then(|| {
-        lash_protocol_rlm::rlm_protocol_event(RlmProtocolEvent::RlmSeed(
-            lash_rlm_types::RlmSeedPluginBody {
-                globals,
-                projected: Default::default(),
+fn list_async_handles_tool_definition() -> ToolDefinition {
+    clbench_list_async_handles_tool_definition()
+}
+
+fn clbench_list_async_handles_tool_definition() -> ToolDefinition {
+    ToolDefinition::raw(
+        "list_async_handles",
+        "List live lashlang async handles only. Returns `{ monitor: { monitor_id: handle }, subagent: { name: handle }, tool: { id: handle } }`; terminal, awaited, or cancelled handles are omitted. In CLBench, use this to rediscover live `start call` handles after a handoff or long-running fan-out.",
+        ToolDefinition::default_input_schema(),
+        json!({
+            "type": "object",
+            "properties": {
+                "monitor": { "type": "object" },
+                "subagent": { "type": "object" },
+                "tool": { "type": "object" }
             },
-        ))
-    })
+            "required": ["monitor", "subagent", "tool"]
+        }),
+    )
+    .with_examples(vec![r#"handles = (call list_async_handles {})?"#.into()])
+    .with_execution_mode(ToolExecutionMode::Parallel)
+}
+
+fn build_globals_patch(request: &RunnerRequest) -> Option<RlmGlobalsPatchPluginBody> {
+    let mut set_default = serde_json::Map::new();
+    if request.init_diary {
+        set_default.insert("diary".to_string(), Value::Array(Vec::new()));
+    }
+    (!set_default.is_empty()).then_some(RlmGlobalsPatchPluginBody { set_default })
 }
 
 fn build_projected_bindings(
     request: &RunnerRequest,
-) -> anyhow::Result<lash_protocol_rlm::RlmProjectedBindings> {
-    Ok(lash_protocol_rlm::RlmProjectedBindings::new()
+) -> anyhow::Result<lash_mode_rlm::RlmProjectedBindings> {
+    Ok(lash_mode_rlm::RlmProjectedBindings::new()
         .bind_json("iteration", json!(request.iteration))?
         .bind_json("current_query", json!(request.prompt))?
         .bind_json(
@@ -305,12 +371,27 @@ fn build_projected_bindings(
 }
 
 fn resolve_provider(provider_id: Option<&str>) -> Result<ProviderHandle> {
-    bench_common::load_provider(provider_id)
+    let config_path = lash_home().join("config.json");
+    let mut config = LashConfig::load(&config_path)
+        .ok_or_else(|| anyhow::anyhow!("missing or invalid {}", config_path.display()))?;
+    if let Some(provider_id) = provider_id {
+        config
+            .set_active_provider_kind(provider_id)
+            .map_err(anyhow::Error::msg)?;
+    }
+    config.build_active_provider().map_err(anyhow::Error::msg)
+}
+
+fn lash_home() -> PathBuf {
+    std::env::var_os("LASH_HOME")
+        .map(PathBuf::from)
+        .or_else(|| dirs::home_dir().map(|home| home.join(".lash")))
+        .unwrap_or_else(|| Path::new(".lash").to_path_buf())
 }
 
 fn turn_status_label(outcome: &TurnOutcome) -> &'static str {
     match outcome {
-        TurnOutcome::Finished(_) | TurnOutcome::AgentFrameSwitch { .. } => "completed",
+        TurnOutcome::Finished(_) | TurnOutcome::Handoff { .. } => "completed",
         TurnOutcome::Stopped(TurnStop::Cancelled) => "interrupted",
         TurnOutcome::Stopped(_) => "failed",
     }
@@ -319,9 +400,9 @@ fn turn_status_label(outcome: &TurnOutcome) -> &'static str {
 fn done_reason_label(outcome: &TurnOutcome) -> &'static str {
     match outcome {
         TurnOutcome::Finished(TurnFinish::AssistantMessage { .. }) => "assistant_message",
-        TurnOutcome::Finished(TurnFinish::FinalValue { .. }) => "submitted_value",
+        TurnOutcome::Finished(TurnFinish::SubmittedValue { .. }) => "submitted_value",
         TurnOutcome::Finished(TurnFinish::ToolValue { .. }) => "tool_value",
-        TurnOutcome::AgentFrameSwitch { .. } => "agent_frame_switch",
+        TurnOutcome::Handoff { .. } => "handoff",
         TurnOutcome::Stopped(TurnStop::Cancelled) => "cancelled",
         TurnOutcome::Stopped(TurnStop::Incomplete) => "incomplete",
         TurnOutcome::Stopped(TurnStop::InvalidInput) => "invalid_input",
@@ -339,65 +420,35 @@ fn done_reason_label(outcome: &TurnOutcome) -> &'static str {
 mod tests {
     use super::*;
 
-    #[tokio::test]
-    async fn clbench_rlm_tool_surface_exposes_explicit_limited_tools() {
-        let core = LashCore::rlm_builder(lash::rlm::RlmProtocolPluginFactory::new(
-            clbench_rlm_config(),
-            Arc::new(lash::persistence::InMemoryLashlangArtifactStore::new()),
-        ))
-        .model(
-            ModelSpec::from_token_limits("mock-model", None, DEFAULT_MAX_CONTEXT_TOKENS, None)
-                .expect("valid model spec"),
-        )
-        .store_factory(Arc::new(
-            lash::persistence::InMemorySessionStoreFactory::new(),
-        ))
-        .process_registry(Arc::new(TestLocalProcessRegistry::default()))
-        .process_env_store(Arc::new(
-            lash::persistence::InMemoryProcessExecutionEnvStore::new(),
-        ))
-        .effect_host(Arc::new(lash::durability::InlineEffectHost::default()))
-        .attachment_store(Arc::new(lash::persistence::InMemoryAttachmentStore::new()))
-        .plugins(build_plugin_stack())
-        .build()
-        .expect("core");
-        let session = core.session("root").open().await.expect("session");
+    #[test]
+    fn clbench_rlm_tool_surface_exposes_explicit_limited_tools() {
+        let mode = ExecutionMode::new("rlm");
+        let policy = SessionPolicy {
+            execution_mode: mode.clone(),
+            ..SessionPolicy::default()
+        };
+        let session = build_plugin_session(mode.clone(), &policy).expect("plugin session");
+        let surface = session.tool_surface("root", mode);
 
-        let mut ordinary_names = session
-            .observe()
-            .active_tool_manifests()
+        let mut names = surface.tool_names().as_ref().clone();
+        names.sort();
+        let mut child_names = clbench_tool_definitions()
             .into_iter()
             .map(|tool| tool.name)
             .collect::<Vec<_>>();
-        ordinary_names.sort();
-        let mut benchmark_names = clbench_tool_definitions()
-            .into_iter()
-            .map(|tool| tool.name().to_string())
-            .collect::<Vec<_>>();
-        benchmark_names.sort();
+        child_names.sort();
         assert_eq!(
-            ordinary_names,
+            names,
             vec![
                 "continue_as",
-                "list_process_handles",
+                "list_async_handles",
                 "llm_query",
                 "spawn_agent"
             ]
         );
         assert_eq!(
-            benchmark_names,
-            vec![
-                "continue_as",
-                "list_process_handles",
-                "llm_query",
-                "spawn_agent"
-            ]
-        );
-        assert!(
-            !benchmark_names
-                .iter()
-                .any(|name| name.as_str() == "cancel_process"),
-            "CLBench installs process controls in locked-down list-only mode"
+            child_names, names,
+            "CLBench subagents use the same tools as the root agent"
         );
 
         for denied in [
@@ -410,21 +461,32 @@ mod tests {
             "monitor",
         ] {
             assert!(
-                !benchmark_names.iter().any(|name| name == denied),
+                !surface.has_callable_tool(denied),
                 "{denied} must not be callable in CLBench"
             );
         }
 
+        let docs = surface.prompt_tool_docs();
         for expected in [
             "llm_query",
             "spawn_agent",
             "continue_as",
-            "list_process_handles",
+            "list_async_handles",
         ] {
             assert!(
-                benchmark_names.iter().any(|name| name == expected),
+                docs.contains(expected),
                 "{expected} must be documented in the RLM prompt"
             );
         }
+        assert!(
+            !docs.contains("peer"),
+            "CLBench prompt must not advertise unavailable peer capability"
+        );
+
+        assert_eq!(
+            surface.model_tool_specs().len(),
+            0,
+            "RLM prompt-only tool surfaces must not eagerly build provider model specs"
+        );
     }
 }

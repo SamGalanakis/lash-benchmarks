@@ -201,19 +201,21 @@ checksum = "72b3254f16251a8381aa12e40e3c4d2f0199f8c6508fbecb9d91f575e0fbb8c6"
 
 [[package]]
 name = "bench-clbench-lash"
-version = "0.1.0-alpha.82"
+version = "0.2.131"
 dependencies = [
  "anyhow",
  "async-trait",
  "bench-common",
  "clap",
+ "dirs 6.0.0",
+ "lash",
+ "lash-cli",
  "lash-core",
  "lash-harness-opt",
  "lash-llm-tools",
- "lash-plugin-process-controls",
- "lash-protocol-rlm",
+ "lash-mode-rlm",
+ "lash-providers-builtin",
  "lash-rlm-types",
- "lash-runtime",
  "lash-sqlite-store",
  "lash-subagents",
  "serde",
@@ -224,12 +226,13 @@ dependencies = [
 
 [[package]]
 name = "bench-common"
-version = "0.1.0-alpha.82"
+version = "0.2.131"
 dependencies = [
  "anyhow",
  "dirs 6.0.0",
  "lash-core",
  "lash-provider-anthropic",
+ "lash-provider-codex",
  "lash-provider-google",
  "lash-provider-openai",
  "serde",
@@ -238,7 +241,7 @@ dependencies = [
 
 [[package]]
 name = "bench-frontier-cs"
-version = "0.1.0-alpha.82"
+version = "0.2.131"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -247,15 +250,15 @@ dependencies = [
  "clap",
  "dirs 6.0.0",
  "dotenvy",
+ "lash",
  "lash-cli",
  "lash-core",
  "lash-export",
  "lash-llm-tools",
- "lash-plugin-process-controls",
- "lash-protocol-rlm",
+ "lash-mode-rlm",
  "lash-provider-openai",
+ "lash-providers-builtin",
  "lash-rlm-types",
- "lash-runtime",
  "lash-sqlite-store",
  "lash-subagents",
  "serde",
@@ -266,7 +269,7 @@ dependencies = [
 
 [[package]]
 name = "bench-longcot"
-version = "0.1.0-alpha.82"
+version = "0.2.131"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -275,14 +278,14 @@ dependencies = [
  "clap",
  "dirs 6.0.0",
  "dotenvy",
+ "lash",
  "lash-cli",
  "lash-core",
  "lash-export",
  "lash-llm-tools",
- "lash-plugin-process-controls",
- "lash-protocol-rlm",
+ "lash-mode-rlm",
  "lash-provider-openai",
- "lash-runtime",
+ "lash-providers-builtin",
  "lash-sqlite-store",
  "lash-subagents",
  "regex",
@@ -294,7 +297,7 @@ dependencies = [
 
 [[package]]
 name = "bench-longmemeval-rlm"
-version = "0.1.0-alpha.82"
+version = "0.2.131"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -302,12 +305,14 @@ dependencies = [
  "chrono",
  "clap",
  "dotenvy",
+ "lash",
  "lash-core",
  "lash-llm-tools",
+ "lash-mode-rlm",
  "lash-plugin-observational-memory",
- "lash-protocol-rlm",
+ "lash-plugin-rolling-history",
  "lash-provider-openai",
- "lash-runtime",
+ "lash-providers-builtin",
  "lash-sqlite-store",
  "lash-standard-plugins",
  "lash-subagents",
@@ -322,7 +327,7 @@ dependencies = [
 
 [[package]]
 name = "bench-oolong"
-version = "0.1.0-alpha.82"
+version = "0.2.131"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -331,15 +336,15 @@ dependencies = [
  "clap",
  "dirs 6.0.0",
  "dotenvy",
+ "lash",
  "lash-cli",
  "lash-core",
  "lash-export",
  "lash-llm-tools",
- "lash-plugin-process-controls",
- "lash-protocol-rlm",
+ "lash-mode-rlm",
  "lash-provider-openai",
+ "lash-providers-builtin",
  "lash-rlm-types",
- "lash-runtime",
  "lash-sqlite-store",
  "lash-subagents",
  "serde",
@@ -350,18 +355,24 @@ dependencies = [
 
 [[package]]
 name = "bench-swebench"
-version = "0.1.0-alpha.82"
+version = "0.2.131"
 dependencies = [
  "anyhow",
  "async-trait",
  "bench-common",
  "chrono",
  "clap",
+ "dirs 6.0.0",
  "dotenvy",
+ "lash",
+ "lash-cli",
  "lash-core",
  "lash-llm-tools",
+ "lash-mode-rlm",
+ "lash-mode-standard",
  "lash-plugin-observational-memory",
- "lash-runtime",
+ "lash-plugin-rolling-history",
+ "lash-providers-builtin",
  "lash-sqlite-store",
  "lash-standard-plugins",
  "lash-subagents",
@@ -373,7 +384,7 @@ dependencies = [
 
 [[package]]
 name = "bench-warden-sentry"
-version = "0.1.0-alpha.82"
+version = "0.2.131"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -381,13 +392,20 @@ dependencies = [
  "chrono",
  "clap",
  "dotenvy",
+ "lash",
  "lash-core",
+ "lash-mode-rlm",
+ "lash-mode-standard",
  "lash-plugin-observational-memory",
- "lash-runtime",
- "lash-search-tools",
+ "lash-plugin-rolling-history",
+ "lash-plugin-tool-discovery",
+ "lash-providers-builtin",
  "lash-sqlite-store",
  "lash-standard-plugins",
- "lash-tools",
+ "lash-tool-apply-patch",
+ "lash-tool-files",
+ "lash-tool-search",
+ "lash-tool-shell",
  "regex",
  "serde",
  "serde_json",
@@ -785,12 +803,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "data-encoding"
-version = "2.11.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a4ae5f15dda3c708c0ade84bfee31ccab44a3da4f88015ed22f63732abe300c8"
-
-[[package]]
 name = "deranged"
 version = "0.5.8"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -804,7 +816,6 @@ checksum = "9ed9a281f7bc9b7576e61468ba615a66a5c8cfdff42420a70aa82701a3b1e292"
 dependencies = [
  "block-buffer",
  "crypto-common",
- "subtle",
 ]
 
 [[package]]
@@ -1406,15 +1417,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "hmac"
-version = "0.12.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6c49c37c09c17a53d937dfbb742eb3a961d65a994e6bcdcf37e7399d0cc8ab5e"
-dependencies = [
- "digest",
-]
-
-[[package]]
 name = "http"
 version = "1.4.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1855,14 +1857,31 @@ dependencies = [
 ]
 
 [[package]]
-name = "lash-autoresearch"
-version = "0.1.0-alpha.82"
-source = "git+https://github.com/SamGalanakis/lash?tag=v0.1.0-alpha.82#bb246f3009d317260945e2f96f36613312b394e1"
+name = "lash"
+version = "0.2.131"
+source = "git+https://github.com/SamGalanakis/lash?tag=v0.2.131#2d4f5b490225ca0b4a653e7398bcd24725c7d024"
 dependencies = [
  "async-trait",
  "lash-core",
- "lash-lashlang-runtime",
- "lash-runtime",
+ "lash-mode-rlm",
+ "lash-mode-standard",
+ "lash-rlm-types",
+ "lash-trace",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
+ "tokio",
+ "tokio-util",
+]
+
+[[package]]
+name = "lash-autoresearch"
+version = "0.2.131"
+source = "git+https://github.com/SamGalanakis/lash?tag=v0.2.131#2d4f5b490225ca0b4a653e7398bcd24725c7d024"
+dependencies = [
+ "async-trait",
+ "lash",
+ "lash-core",
  "lash-tui",
  "lash-tui-extensions",
  "schemars",
@@ -1874,8 +1893,8 @@ dependencies = [
 
 [[package]]
 name = "lash-cli"
-version = "0.1.0-alpha.82"
-source = "git+https://github.com/SamGalanakis/lash?tag=v0.1.0-alpha.82#bb246f3009d317260945e2f96f36613312b394e1"
+version = "0.2.131"
+source = "git+https://github.com/SamGalanakis/lash?tag=v0.2.131#2d4f5b490225ca0b4a653e7398bcd24725c7d024"
 dependencies = [
  "anyhow",
  "arboard",
@@ -1885,42 +1904,41 @@ dependencies = [
  "clap",
  "crossterm",
  "dirs 6.0.0",
- "futures-util",
  "image",
+ "lash",
  "lash-autoresearch",
  "lash-core",
  "lash-export",
  "lash-file-index",
- "lash-lashlang-runtime",
  "lash-llm-tools",
+ "lash-mode-rlm",
+ "lash-mode-standard",
  "lash-plugin-mcp",
  "lash-plugin-plan-mode",
- "lash-plugin-process-controls",
- "lash-protocol-rlm",
- "lash-protocol-standard",
+ "lash-plugin-prompt-context",
+ "lash-plugin-ui-activity",
  "lash-provider-anthropic",
  "lash-provider-auth",
+ "lash-provider-codex",
  "lash-provider-google",
  "lash-provider-openai",
+ "lash-providers-builtin",
  "lash-rlm-types",
- "lash-runtime",
- "lash-search-tools",
  "lash-sqlite-store",
  "lash-standard-plugins",
  "lash-subagents",
- "lash-tool-support",
  "lash-tui",
  "lash-tui-extensions",
  "pulldown-cmark",
  "rand 0.9.4",
  "reqwest 0.13.4",
- "schemars",
  "semver",
  "serde",
  "serde_json",
  "sha2",
- "strsim",
+ "stats_alloc",
  "tokio",
+ "tokio-util",
  "tracing",
  "tracing-subscriber",
  "unicode-width",
@@ -1929,21 +1947,24 @@ dependencies = [
 
 [[package]]
 name = "lash-core"
-version = "0.1.0-alpha.82"
-source = "git+https://github.com/SamGalanakis/lash?tag=v0.1.0-alpha.82#bb246f3009d317260945e2f96f36613312b394e1"
+version = "0.2.131"
+source = "git+https://github.com/SamGalanakis/lash?tag=v0.2.131#2d4f5b490225ca0b4a653e7398bcd24725c7d024"
 dependencies = [
  "arc-swap",
  "async-trait",
  "chrono",
  "futures-util",
- "hmac",
+ "jsonschema",
  "lash-sansio",
  "lash-trace",
+ "libc",
  "regex",
+ "reqwest 0.13.4",
  "schemars",
  "serde",
  "serde_json",
  "sha2",
+ "tempfile",
  "thiserror 2.0.18",
  "tokio",
  "tokio-util",
@@ -1953,25 +1974,24 @@ dependencies = [
 
 [[package]]
 name = "lash-export"
-version = "0.1.0-alpha.82"
-source = "git+https://github.com/SamGalanakis/lash?tag=v0.1.0-alpha.82#bb246f3009d317260945e2f96f36613312b394e1"
+version = "0.2.131"
+source = "git+https://github.com/SamGalanakis/lash?tag=v0.2.131#2d4f5b490225ca0b4a653e7398bcd24725c7d024"
 dependencies = [
  "anyhow",
  "clap",
  "lash-core",
- "lash-protocol-rlm",
+ "lash-mode-rlm",
  "lash-rlm-types",
  "lash-sqlite-store",
  "pulldown-cmark",
  "serde",
  "serde_json",
- "tokio",
 ]
 
 [[package]]
 name = "lash-file-index"
-version = "0.1.0-alpha.82"
-source = "git+https://github.com/SamGalanakis/lash?tag=v0.1.0-alpha.82#bb246f3009d317260945e2f96f36613312b394e1"
+version = "0.2.131"
+source = "git+https://github.com/SamGalanakis/lash?tag=v0.2.131#2d4f5b490225ca0b4a653e7398bcd24725c7d024"
 dependencies = [
  "ignore",
  "notify",
@@ -1980,18 +2000,18 @@ dependencies = [
 
 [[package]]
 name = "lash-harness-opt"
-version = "0.1.0-alpha.82"
-source = "git+https://github.com/SamGalanakis/lash?tag=v0.1.0-alpha.82#bb246f3009d317260945e2f96f36613312b394e1"
+version = "0.2.131"
+source = "git+https://github.com/SamGalanakis/lash?tag=v0.2.131#2d4f5b490225ca0b4a653e7398bcd24725c7d024"
 dependencies = [
  "anyhow",
  "async-trait",
  "clap",
  "dirs 6.0.0",
+ "lash",
  "lash-cli",
  "lash-core",
- "lash-protocol-rlm",
+ "lash-providers-builtin",
  "lash-rlm-types",
- "lash-runtime",
  "lash-sansio",
  "lash-trace",
  "rusqlite",
@@ -2004,90 +2024,104 @@ dependencies = [
 ]
 
 [[package]]
-name = "lash-lashlang-runtime"
-version = "0.1.0-alpha.82"
-source = "git+https://github.com/SamGalanakis/lash?tag=v0.1.0-alpha.82#bb246f3009d317260945e2f96f36613312b394e1"
-dependencies = [
- "async-trait",
- "chrono",
- "lash-core",
- "lash-remote-protocol",
- "lash-trace",
- "lashlang",
- "serde",
- "serde_json",
- "sha2",
- "tokio",
- "tokio-util",
- "uuid",
-]
-
-[[package]]
 name = "lash-llm-tools"
-version = "0.1.0-alpha.82"
-source = "git+https://github.com/SamGalanakis/lash?tag=v0.1.0-alpha.82#bb246f3009d317260945e2f96f36613312b394e1"
+version = "0.2.131"
+source = "git+https://github.com/SamGalanakis/lash?tag=v0.2.131#2d4f5b490225ca0b4a653e7398bcd24725c7d024"
 dependencies = [
  "async-trait",
  "jsonschema",
  "lash-core",
- "lash-lashlang-runtime",
- "lash-tool-support",
+ "lashlang",
  "serde_json",
 ]
 
 [[package]]
 name = "lash-llm-transport"
-version = "0.1.0-alpha.82"
-source = "git+https://github.com/SamGalanakis/lash?tag=v0.1.0-alpha.82#bb246f3009d317260945e2f96f36613312b394e1"
+version = "0.2.131"
+source = "git+https://github.com/SamGalanakis/lash?tag=v0.2.131#2d4f5b490225ca0b4a653e7398bcd24725c7d024"
 dependencies = [
- "async-trait",
  "bytes",
  "lash-core",
  "lash-sansio",
  "reqwest 0.13.4",
- "serde_json",
  "tokio",
 ]
 
 [[package]]
+name = "lash-mode-rlm"
+version = "0.2.131"
+source = "git+https://github.com/SamGalanakis/lash?tag=v0.2.131#2d4f5b490225ca0b4a653e7398bcd24725c7d024"
+dependencies = [
+ "async-trait",
+ "jsonschema",
+ "lash-core",
+ "lash-rlm-types",
+ "lashlang",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "tracing",
+ "uuid",
+]
+
+[[package]]
+name = "lash-mode-standard"
+version = "0.2.131"
+source = "git+https://github.com/SamGalanakis/lash?tag=v0.2.131#2d4f5b490225ca0b4a653e7398bcd24725c7d024"
+dependencies = [
+ "async-trait",
+ "lash-core",
+ "serde_json",
+]
+
+[[package]]
+name = "lash-openai-schema"
+version = "0.2.131"
+source = "git+https://github.com/SamGalanakis/lash?tag=v0.2.131#2d4f5b490225ca0b4a653e7398bcd24725c7d024"
+dependencies = [
+ "lash-sansio",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "lash-plugin-mcp"
-version = "0.1.0-alpha.82"
-source = "git+https://github.com/SamGalanakis/lash?tag=v0.1.0-alpha.82#bb246f3009d317260945e2f96f36613312b394e1"
+version = "0.2.131"
+source = "git+https://github.com/SamGalanakis/lash?tag=v0.2.131#2d4f5b490225ca0b4a653e7398bcd24725c7d024"
 dependencies = [
  "async-trait",
  "base64",
- "http",
  "lash-core",
- "lash-lashlang-runtime",
- "lash-tool-support",
  "rmcp",
  "serde",
  "serde_json",
  "thiserror 2.0.18",
  "tokio",
- "tracing",
 ]
 
 [[package]]
 name = "lash-plugin-observational-memory"
-version = "0.1.0-alpha.82"
-source = "git+https://github.com/SamGalanakis/lash?tag=v0.1.0-alpha.82#bb246f3009d317260945e2f96f36613312b394e1"
+version = "0.2.131"
+source = "git+https://github.com/SamGalanakis/lash?tag=v0.2.131#2d4f5b490225ca0b4a653e7398bcd24725c7d024"
 dependencies = [
  "async-trait",
  "chrono",
  "lash-core",
+ "regex",
  "serde",
  "serde_json",
+ "tracing",
 ]
 
 [[package]]
 name = "lash-plugin-plan-mode"
-version = "0.1.0-alpha.82"
-source = "git+https://github.com/SamGalanakis/lash?tag=v0.1.0-alpha.82#bb246f3009d317260945e2f96f36613312b394e1"
+version = "0.2.131"
+source = "git+https://github.com/SamGalanakis/lash?tag=v0.2.131#2d4f5b490225ca0b4a653e7398bcd24725c7d024"
 dependencies = [
  "async-trait",
  "lash-core",
- "lash-tool-support",
+ "lash-tool-apply-patch",
  "schemars",
  "serde",
  "serde_json",
@@ -2096,61 +2130,51 @@ dependencies = [
 ]
 
 [[package]]
-name = "lash-plugin-process-controls"
-version = "0.1.0-alpha.82"
-source = "git+https://github.com/SamGalanakis/lash?tag=v0.1.0-alpha.82#bb246f3009d317260945e2f96f36613312b394e1"
+name = "lash-plugin-prompt-context"
+version = "0.2.131"
+source = "git+https://github.com/SamGalanakis/lash?tag=v0.2.131#2d4f5b490225ca0b4a653e7398bcd24725c7d024"
 dependencies = [
  "async-trait",
+ "chrono",
  "lash-core",
- "lash-lashlang-runtime",
- "lash-tool-support",
- "serde_json",
+ "serde",
 ]
 
 [[package]]
-name = "lash-plugin-tool-output-budget"
-version = "0.1.0-alpha.82"
-source = "git+https://github.com/SamGalanakis/lash?tag=v0.1.0-alpha.82#bb246f3009d317260945e2f96f36613312b394e1"
+name = "lash-plugin-rolling-history"
+version = "0.2.131"
+source = "git+https://github.com/SamGalanakis/lash?tag=v0.2.131#2d4f5b490225ca0b4a653e7398bcd24725c7d024"
 dependencies = [
+ "async-trait",
  "lash-core",
- "serde",
- "serde_json",
  "sha2",
 ]
 
 [[package]]
-name = "lash-protocol-rlm"
-version = "0.1.0-alpha.82"
-source = "git+https://github.com/SamGalanakis/lash?tag=v0.1.0-alpha.82#bb246f3009d317260945e2f96f36613312b394e1"
+name = "lash-plugin-tool-discovery"
+version = "0.2.131"
+source = "git+https://github.com/SamGalanakis/lash?tag=v0.2.131#2d4f5b490225ca0b4a653e7398bcd24725c7d024"
 dependencies = [
  "async-trait",
- "jsonschema",
  "lash-core",
- "lash-lashlang-runtime",
- "lash-rlm-types",
- "lashlang",
- "serde",
+ "schemars",
  "serde_json",
- "tempfile",
- "tokio",
- "uuid",
+ "strsim",
 ]
 
 [[package]]
-name = "lash-protocol-standard"
-version = "0.1.0-alpha.82"
-source = "git+https://github.com/SamGalanakis/lash?tag=v0.1.0-alpha.82#bb246f3009d317260945e2f96f36613312b394e1"
+name = "lash-plugin-ui-activity"
+version = "0.2.131"
+source = "git+https://github.com/SamGalanakis/lash?tag=v0.2.131#2d4f5b490225ca0b4a653e7398bcd24725c7d024"
 dependencies = [
- "async-trait",
  "lash-core",
- "lash-tool-support",
  "serde_json",
 ]
 
 [[package]]
 name = "lash-provider-anthropic"
-version = "0.1.0-alpha.82"
-source = "git+https://github.com/SamGalanakis/lash?tag=v0.1.0-alpha.82#bb246f3009d317260945e2f96f36613312b394e1"
+version = "0.2.131"
+source = "git+https://github.com/SamGalanakis/lash?tag=v0.2.131#2d4f5b490225ca0b4a653e7398bcd24725c7d024"
 dependencies = [
  "async-trait",
  "base64",
@@ -2164,8 +2188,8 @@ dependencies = [
 
 [[package]]
 name = "lash-provider-auth"
-version = "0.1.0-alpha.82"
-source = "git+https://github.com/SamGalanakis/lash?tag=v0.1.0-alpha.82#bb246f3009d317260945e2f96f36613312b394e1"
+version = "0.2.131"
+source = "git+https://github.com/SamGalanakis/lash?tag=v0.2.131#2d4f5b490225ca0b4a653e7398bcd24725c7d024"
 dependencies = [
  "base64",
  "reqwest 0.13.4",
@@ -2176,9 +2200,27 @@ dependencies = [
 ]
 
 [[package]]
+name = "lash-provider-codex"
+version = "0.2.131"
+source = "git+https://github.com/SamGalanakis/lash?tag=v0.2.131#2d4f5b490225ca0b4a653e7398bcd24725c7d024"
+dependencies = [
+ "async-trait",
+ "base64",
+ "lash-core",
+ "lash-llm-transport",
+ "lash-openai-schema",
+ "lash-provider-auth",
+ "reqwest 0.13.4",
+ "serde",
+ "serde_json",
+ "tracing",
+ "uuid",
+]
+
+[[package]]
 name = "lash-provider-google"
-version = "0.1.0-alpha.82"
-source = "git+https://github.com/SamGalanakis/lash?tag=v0.1.0-alpha.82#bb246f3009d317260945e2f96f36613312b394e1"
+version = "0.2.131"
+source = "git+https://github.com/SamGalanakis/lash?tag=v0.2.131#2d4f5b490225ca0b4a653e7398bcd24725c7d024"
 dependencies = [
  "async-trait",
  "base64",
@@ -2195,42 +2237,35 @@ dependencies = [
 
 [[package]]
 name = "lash-provider-openai"
-version = "0.1.0-alpha.82"
-source = "git+https://github.com/SamGalanakis/lash?tag=v0.1.0-alpha.82#bb246f3009d317260945e2f96f36613312b394e1"
+version = "0.2.131"
+source = "git+https://github.com/SamGalanakis/lash?tag=v0.2.131#2d4f5b490225ca0b4a653e7398bcd24725c7d024"
 dependencies = [
  "async-trait",
  "base64",
- "bytes",
- "futures-util",
  "lash-core",
  "lash-llm-transport",
- "lash-provider-auth",
+ "lash-openai-schema",
  "reqwest 0.13.4",
  "serde",
  "serde_json",
- "tokio",
- "tokio-tungstenite",
- "tracing",
  "uuid",
 ]
 
 [[package]]
-name = "lash-remote-protocol"
-version = "0.1.0-alpha.82"
-source = "git+https://github.com/SamGalanakis/lash?tag=v0.1.0-alpha.82#bb246f3009d317260945e2f96f36613312b394e1"
+name = "lash-providers-builtin"
+version = "0.2.131"
+source = "git+https://github.com/SamGalanakis/lash?tag=v0.2.131#2d4f5b490225ca0b4a653e7398bcd24725c7d024"
 dependencies = [
- "base64",
- "lash-core",
- "schemars",
- "serde",
- "serde_json",
- "thiserror 2.0.18",
+ "lash-provider-anthropic",
+ "lash-provider-codex",
+ "lash-provider-google",
+ "lash-provider-openai",
 ]
 
 [[package]]
 name = "lash-rlm-types"
-version = "0.1.0-alpha.82"
-source = "git+https://github.com/SamGalanakis/lash?tag=v0.1.0-alpha.82#bb246f3009d317260945e2f96f36613312b394e1"
+version = "0.2.131"
+source = "git+https://github.com/SamGalanakis/lash?tag=v0.2.131#2d4f5b490225ca0b4a653e7398bcd24725c7d024"
 dependencies = [
  "lash-sansio",
  "serde",
@@ -2238,117 +2273,126 @@ dependencies = [
 ]
 
 [[package]]
-name = "lash-runtime"
-version = "0.1.0-alpha.82"
-source = "git+https://github.com/SamGalanakis/lash?tag=v0.1.0-alpha.82#bb246f3009d317260945e2f96f36613312b394e1"
-dependencies = [
- "async-trait",
- "futures-util",
- "lash-core",
- "lash-lashlang-runtime",
- "lash-plugin-tool-output-budget",
- "lash-protocol-rlm",
- "lash-protocol-standard",
- "lash-remote-protocol",
- "lash-rlm-types",
- "lash-tool-support",
- "lash-trace",
- "lashlang",
- "serde",
- "serde_json",
- "thiserror 2.0.18",
- "tokio",
- "tokio-util",
-]
-
-[[package]]
 name = "lash-sansio"
-version = "0.1.0-alpha.82"
-source = "git+https://github.com/SamGalanakis/lash?tag=v0.1.0-alpha.82#bb246f3009d317260945e2f96f36613312b394e1"
+version = "0.2.131"
+source = "git+https://github.com/SamGalanakis/lash?tag=v0.2.131#2d4f5b490225ca0b4a653e7398bcd24725c7d024"
 dependencies = [
  "schemars",
  "serde",
  "serde_json",
-]
-
-[[package]]
-name = "lash-search-tools"
-version = "0.1.0-alpha.82"
-source = "git+https://github.com/SamGalanakis/lash?tag=v0.1.0-alpha.82#bb246f3009d317260945e2f96f36613312b394e1"
-dependencies = [
- "async-trait",
- "fff-search",
- "lash-core",
- "lash-lashlang-runtime",
- "lash-tool-support",
- "regex",
- "schemars",
- "serde",
- "serde_json",
- "tokio",
- "tokio-util",
+ "uuid",
 ]
 
 [[package]]
 name = "lash-sqlite-store"
-version = "0.1.0-alpha.82"
-source = "git+https://github.com/SamGalanakis/lash?tag=v0.1.0-alpha.82#bb246f3009d317260945e2f96f36613312b394e1"
+version = "0.2.131"
+source = "git+https://github.com/SamGalanakis/lash?tag=v0.2.131#2d4f5b490225ca0b4a653e7398bcd24725c7d024"
 dependencies = [
  "async-trait",
  "flate2",
- "futures-executor",
  "lash-core",
- "lashlang",
  "rmp-serde",
  "rusqlite",
  "serde",
  "serde_json",
  "sha2",
- "tokio",
- "tokio-rusqlite",
  "tracing",
 ]
 
 [[package]]
 name = "lash-standard-plugins"
-version = "0.1.0-alpha.82"
-source = "git+https://github.com/SamGalanakis/lash?tag=v0.1.0-alpha.82#bb246f3009d317260945e2f96f36613312b394e1"
+version = "0.2.131"
+source = "git+https://github.com/SamGalanakis/lash?tag=v0.2.131#2d4f5b490225ca0b4a653e7398bcd24725c7d024"
 dependencies = [
- "async-trait",
  "lash-core",
  "lash-plugin-observational-memory",
- "lash-plugin-process-controls",
- "lash-plugin-tool-output-budget",
- "lash-tools",
- "serde",
+ "lash-plugin-rolling-history",
+ "lash-plugin-tool-discovery",
+ "lash-tool-apply-patch",
+ "lash-tool-files",
+ "lash-tool-search",
+ "lash-tool-shell",
+ "lash-tool-web",
 ]
 
 [[package]]
 name = "lash-subagents"
-version = "0.1.0-alpha.82"
-source = "git+https://github.com/SamGalanakis/lash?tag=v0.1.0-alpha.82#bb246f3009d317260945e2f96f36613312b394e1"
+version = "0.2.131"
+source = "git+https://github.com/SamGalanakis/lash?tag=v0.2.131#2d4f5b490225ca0b4a653e7398bcd24725c7d024"
 dependencies = [
  "async-trait",
  "lash-core",
- "lash-lashlang-runtime",
- "lash-protocol-rlm",
+ "lash-llm-tools",
+ "lash-mode-rlm",
  "lash-rlm-types",
- "lash-tool-support",
  "serde",
  "serde_json",
  "tokio",
+ "tracing",
+]
+
+[[package]]
+name = "lash-tool-apply-patch"
+version = "0.2.131"
+source = "git+https://github.com/SamGalanakis/lash?tag=v0.2.131#2d4f5b490225ca0b4a653e7398bcd24725c7d024"
+dependencies = [
+ "async-trait",
+ "lash-core",
+ "lash-tool-support",
+ "serde_json",
+]
+
+[[package]]
+name = "lash-tool-files"
+version = "0.2.131"
+source = "git+https://github.com/SamGalanakis/lash?tag=v0.2.131#2d4f5b490225ca0b4a653e7398bcd24725c7d024"
+dependencies = [
+ "async-trait",
+ "globset",
+ "lash-core",
+ "lash-tool-support",
+ "pdf-extract",
+ "serde_json",
+]
+
+[[package]]
+name = "lash-tool-search"
+version = "0.2.131"
+source = "git+https://github.com/SamGalanakis/lash?tag=v0.2.131#2d4f5b490225ca0b4a653e7398bcd24725c7d024"
+dependencies = [
+ "async-trait",
+ "fff-search",
+ "lash-core",
+ "lash-tool-support",
+ "regex",
+ "serde_json",
+ "tokio",
+ "tokio-util",
+]
+
+[[package]]
+name = "lash-tool-shell"
+version = "0.2.131"
+source = "git+https://github.com/SamGalanakis/lash?tag=v0.2.131#2d4f5b490225ca0b4a653e7398bcd24725c7d024"
+dependencies = [
+ "async-trait",
+ "lash-core",
+ "lash-tool-support",
+ "libc",
+ "portable-pty",
+ "serde_json",
+ "tokio",
+ "tokio-util",
 ]
 
 [[package]]
 name = "lash-tool-support"
-version = "0.1.0-alpha.82"
-source = "git+https://github.com/SamGalanakis/lash?tag=v0.1.0-alpha.82#bb246f3009d317260945e2f96f36613312b394e1"
+version = "0.2.131"
+source = "git+https://github.com/SamGalanakis/lash?tag=v0.2.131#2d4f5b490225ca0b4a653e7398bcd24725c7d024"
 dependencies = [
- "async-trait",
+ "chrono",
  "ignore",
  "lash-core",
- "lash-lashlang-runtime",
- "schemars",
  "serde",
  "serde_json",
  "similar",
@@ -2356,31 +2400,21 @@ dependencies = [
 ]
 
 [[package]]
-name = "lash-tools"
-version = "0.1.0-alpha.82"
-source = "git+https://github.com/SamGalanakis/lash?tag=v0.1.0-alpha.82#bb246f3009d317260945e2f96f36613312b394e1"
+name = "lash-tool-web"
+version = "0.2.131"
+source = "git+https://github.com/SamGalanakis/lash?tag=v0.2.131#2d4f5b490225ca0b4a653e7398bcd24725c7d024"
 dependencies = [
  "async-trait",
- "globset",
  "lash-core",
- "lash-lashlang-runtime",
  "lash-tool-support",
- "libc",
- "pdf-extract",
- "portable-pty",
  "reqwest 0.13.4",
- "schemars",
- "serde",
  "serde_json",
- "tokio",
- "tokio-util",
- "unicode-normalization",
 ]
 
 [[package]]
 name = "lash-trace"
-version = "0.1.0-alpha.82"
-source = "git+https://github.com/SamGalanakis/lash?tag=v0.1.0-alpha.82#bb246f3009d317260945e2f96f36613312b394e1"
+version = "0.2.131"
+source = "git+https://github.com/SamGalanakis/lash?tag=v0.2.131#2d4f5b490225ca0b4a653e7398bcd24725c7d024"
 dependencies = [
  "chrono",
  "serde",
@@ -2392,8 +2426,8 @@ dependencies = [
 
 [[package]]
 name = "lash-tui"
-version = "0.1.0-alpha.82"
-source = "git+https://github.com/SamGalanakis/lash?tag=v0.1.0-alpha.82#bb246f3009d317260945e2f96f36613312b394e1"
+version = "0.2.131"
+source = "git+https://github.com/SamGalanakis/lash?tag=v0.2.131#2d4f5b490225ca0b4a653e7398bcd24725c7d024"
 dependencies = [
  "anyhow",
  "crossterm",
@@ -2402,27 +2436,27 @@ dependencies = [
 
 [[package]]
 name = "lash-tui-extensions"
-version = "0.1.0-alpha.82"
-source = "git+https://github.com/SamGalanakis/lash?tag=v0.1.0-alpha.82#bb246f3009d317260945e2f96f36613312b394e1"
+version = "0.2.131"
+source = "git+https://github.com/SamGalanakis/lash?tag=v0.2.131#2d4f5b490225ca0b4a653e7398bcd24725c7d024"
 dependencies = [
  "async-trait",
- "lash-runtime",
+ "lash",
+ "lash-plugin-plan-mode",
  "lash-tui",
  "serde_json",
 ]
 
 [[package]]
 name = "lashlang"
-version = "0.1.0-alpha.82"
-source = "git+https://github.com/SamGalanakis/lash?tag=v0.1.0-alpha.82#bb246f3009d317260945e2f96f36613312b394e1"
+version = "0.2.131"
+source = "git+https://github.com/SamGalanakis/lash?tag=v0.2.131#2d4f5b490225ca0b4a653e7398bcd24725c7d024"
 dependencies = [
- "async-trait",
  "compact_str",
  "futures-executor",
+ "futures-util",
  "rustc-hash",
  "serde",
  "serde_json",
- "sha2",
  "smallvec",
  "thiserror 2.0.18",
 ]
@@ -2462,9 +2496,9 @@ dependencies = [
 
 [[package]]
 name = "libsqlite3-sys"
-version = "0.35.0"
+version = "0.31.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "133c182a6a2c87864fe97778797e46c7e999672690dc9fa3ee8e241aa4a9c13f"
+checksum = "ad8935b44e7c13394a179a438e0cebba0fe08fe01b54f152e29a93b5cf993fd4"
 dependencies = [
  "cc",
  "pkg-config",
@@ -3544,9 +3578,9 @@ dependencies = [
 
 [[package]]
 name = "rusqlite"
-version = "0.37.0"
+version = "0.33.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "165ca6e57b20e1351573e3729b958bc62f0e48025386970b6e4d29e7a7e71f3f"
+checksum = "1c6d5e5acb6f6129fe3f7ba0a7fc77bca1942cb568535e18e7bc40262baf3110"
 dependencies = [
  "bitflags 2.13.0",
  "fallible-iterator",
@@ -3848,17 +3882,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "sha1"
-version = "0.10.6"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e3bf829a2d51ab4a5ddf1352d8470c140cadc8301b2ae1789db023f01cedd6ba"
-dependencies = [
- "cfg-if",
- "cpufeatures 0.2.17",
- "digest",
-]
-
-[[package]]
 name = "sha2"
 version = "0.10.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4023,6 +4046,12 @@ name = "static_assertions"
 version = "1.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "a2eb9349b6444b326872e140eb1cf5e7c522154d69e7a0ffb0fb81c06b37543f"
+
+[[package]]
+name = "stats_alloc"
+version = "0.1.10"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5c0e04424e733e69714ca1bbb9204c1a57f09f5493439520f9f68c132ad25eec"
 
 [[package]]
 name = "strsim"
@@ -4242,17 +4271,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "tokio-rusqlite"
-version = "0.7.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "302563ae4a2127f3d2c105f4f2f0bd7cae3609371755600ebc148e0ccd8510d6"
-dependencies = [
- "crossbeam-channel",
- "rusqlite",
- "tokio",
-]
-
-[[package]]
 name = "tokio-rustls"
 version = "0.26.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4271,22 +4289,6 @@ dependencies = [
  "futures-core",
  "pin-project-lite",
  "tokio",
-]
-
-[[package]]
-name = "tokio-tungstenite"
-version = "0.29.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8f72a05e828585856dacd553fba484c242c46e391fb0e58917c942ee9202915c"
-dependencies = [
- "futures-util",
- "log",
- "rustls",
- "rustls-pki-types",
- "tokio",
- "tokio-rustls",
- "tungstenite",
- "webpki-roots 0.26.11",
 ]
 
 [[package]]
@@ -4492,24 +4494,6 @@ name = "try-lock"
 version = "0.2.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e421abadd41a4225275504ea4d6566923418b7f05506fbc9c0fe86ba7396114b"
-
-[[package]]
-name = "tungstenite"
-version = "0.29.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6c01152af293afb9c7c2a57e4b559c5620b421f6d133261c60dd2d0cdb38e6b8"
-dependencies = [
- "bytes",
- "data-encoding",
- "http",
- "httparse",
- "log",
- "rand 0.9.4",
- "rustls",
- "rustls-pki-types",
- "sha1",
- "thiserror 2.0.18",
-]
 
 [[package]]
 name = "type1-encoding-parser"
@@ -4816,24 +4800,6 @@ name = "webpki-root-certs"
 version = "1.0.8"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0d46a5a140e6f7afeccd8eae97eff335163939eac8b929834875168b29b3d267"
-dependencies = [
- "rustls-pki-types",
-]
-
-[[package]]
-name = "webpki-roots"
-version = "0.26.11"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "521bc38abb08001b01866da9f51eb7c5d647a19260e00054a8c7fd5f9e57f7a9"
-dependencies = [
- "webpki-roots 1.0.8",
-]
-
-[[package]]
-name = "webpki-roots"
-version = "1.0.8"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "bf85cb06032201fa7c6f829d7db5a7e5aa45bcc0655327713065f6f0576731bf"
 dependencies = [
  "rustls-pki-types",
 ]

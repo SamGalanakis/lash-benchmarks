@@ -32,74 +32,38 @@ REMOTE_LASH_CONFIG = f"{REMOTE_LASH_HOME}/config.json"
 REMOTE_CA_CERT_DIR = "/etc/ssl/certs"
 REMOTE_CA_CERT_BUNDLE = f"{REMOTE_CA_CERT_DIR}/ca-certificates.crt"
 
-BENCHMARK_GUIDELINES_APPEND = """## What "finishing" means for this task
+BENCHMARK_GUIDELINES_APPEND = """## Terminal-Bench grading notes
 
 Most terminal-bench tasks are graded by inspecting the environment
-after you stop — files, services, running processes, configuration
+after the agent stops: files, services, running processes, configuration
 state. For these tasks:
 
 - Make the required changes directly to the filesystem / services.
-- Verify the end state (re-open files, re-run the service's own check,
-  probe the port, read the expected output).
-- Submit the final result with `submit <expr>` once you've confirmed the
-  required end state.
-
-Only `submit <value>` when the task explicitly asks you to return a
-computed value (e.g. "print the total count"). Never submit
-exploration output (file listings, version strings, tree dumps) as if
-it were the answer — the grader is not reading your response.
+- Verify the final observable state with task-specific checks.
 
 ## Strict verifier rules
 
 - You are graded by exact checks. Match required filenames, file
   contents, output formats, ports, protocols, and process state
   precisely. Approximate solutions fail.
-- If the task implies a service or port must be reachable, confirm it
-  yourself (curl / nc / the service's own healthcheck) before stopping.
-- Prefer direct verification over assumption. Re-open the exact file
-  and check the exact bytes; re-run the check the task describes.
+- If the task implies a service or port must be reachable, confirm that
+  the actual endpoint remains reachable before stopping.
+- Prefer direct verification over assumption.
 - Hidden verifier tests may check details not shown in the task. Do not
-  treat `test -f`, `ls`, `sed`, or a successful command exit as enough
+  treat superficial existence checks or generic command success as enough
   verification. Your final check should assert the task-specific
-  invariants: exact counts, exact JSON values, imports from the installed
-  location, service behavior, permissions, and process state as applicable.
-- For nontrivial tasks, do not call `submit` in the same lashlang block
-  as the command that performs your final verification. Print the
-  verification result first, inspect it on the next iteration, then submit.
-  The exception is a verification script that exits nonzero on every
-  task-specific mismatch and checks the exact required values, not just
-  file existence or command success.
+  invariants: exact counts, exact values, imports from the installed
+  location, service behavior, permissions, and process state as
+  applicable.
 - Leave the workspace in exactly the state the task asks for. Keep
   required build outputs, installed packages, generated files, services,
   and other artifacts when the task asks for them. Do not leave unrelated
-  scratch files, downloaded archives, backup copies, or exploratory output
-  in directories the task names. Use `/tmp` for intermediate artifacts and
-  clean them up before submitting.
+  scratch files, downloaded archives, backup copies, or exploratory
+  output in directories the task names. Use `/tmp` for intermediate
+  artifacts and clean them up before stopping.
 - For recovery or forensics tasks, copy the original evidence to `/tmp`
   before opening it with tools that may mutate, checkpoint, normalize, or
   delete sidecar files.
-
-## Working efficiently across iterations
-
-- If a setup, build, or verifier script is longer than ~10 lines and
-  you might need to retry it, save it to disk once
-  (`cat > /tmp/verify.sh && chmod +x /tmp/verify.sh`) and re-run on
-  subsequent iterations rather than re-emitting the entire script.
-- The `?` operator on `exec_command` aborts the lashlang block on any
-  non-zero exit (including SIGPIPE 141 from `cmd | head`-style
-  pipelines and timeouts). When you expect a non-zero exit is fine, set
-  `allow_nonzero_exit: true` on the `exec_command` call so you can
-  inspect the result and decide what to do.
-- Any string containing backslashes or backticks (heredocs, regexes,
-  file contents, code excerpts) should use a raw string
-  (`r\"\"\"…\"\"\"` or `r'''…'''`) — over-escaped `\\\\\"` in plain
-  `\"…\"` strings is a frequent cause of lashlang parse errors. Pick
-  the delimiter the body does *not* contain: if your content has `\"\"\"`
-  (e.g. a Python docstring), use `r'''…'''`; if it has `'''`, use
-  `r\"\"\"…\"\"\"`. The first matching closer ends the raw string, so a
-  collision terminates it early. If your lashlang body itself needs to
-  contain literal triple-backticks (e.g. embedding markdown), open the
-  fence with four backticks (` ````lashlang `) and close with the same.
 """
 
 INSTALL_GNU_TIME_COMMAND = """
@@ -309,14 +273,21 @@ class LashAgent(BaseInstalledAgent):
             else ""
         )
         execution_mode_flag = f"--execution-mode {shlex.quote(execution_mode)} "
-        # The old `--prompt-replace` / `--prompt-append` /
-        # `--prompt-disable` flags were removed from the lash CLI.
-        # Instead, we own one benchmark-specific guidance block
-        # (`BENCHMARK_GUIDELINES_APPEND`) and fold it into the user
-        # prompt. The block covers the terminal-bench task shape
-        # (environment-state, not submit-value) and strict verifier
-        # rules. `LASH_BENCH_PROMPT_APPEND_GUIDELINES` overrides the
-        # default for ad-hoc runs.
+        trace_level = os.environ.get("LASH_BENCH_TRACE_LEVEL", "extended").strip()
+        if trace_level not in {"standard", "extended"}:
+            raise ValueError("LASH_BENCH_TRACE_LEVEL must be 'standard' or 'extended'")
+        trace_flags = f"--debug --trace-level {shlex.quote(trace_level)} "
+        if os.environ.get("LASH_BENCH_RLM_TERMINATION", "").strip():
+            raise ValueError(
+                "LASH_BENCH_RLM_TERMINATION is not supported by the v0.2.131 lash CLI; "
+                "submit-required termination is only exposed by the embedded turn builder."
+            )
+
+        turn_usage_path = "/logs/agent/command-0/turn-usage.json"
+        turn_usage_flag = f"--turn-usage-json {shlex.quote(turn_usage_path)} "
+
+        # Keep benchmark guidance about grading shape and strictness only.
+        # Lash owns tool syntax and finalization instructions.
         bench_guidelines = os.environ.get(
             "LASH_BENCH_PROMPT_APPEND_GUIDELINES", BENCHMARK_GUIDELINES_APPEND
         ).strip()
@@ -330,15 +301,63 @@ class LashAgent(BaseInstalledAgent):
         return [
             ExecInput(
                 command=(
+                    f"mkdir -p /logs/agent/command-0 && "
                     f"chmod +x {shlex.quote(lash_binary)} && "
                     f"{shlex.quote(lash_binary)} {model_flag}{variant_flag}"
                     f"{context_approach_flag}{execution_mode_flag}"
+                    f"{trace_flags}{turn_usage_flag}"
                     f"--print {prompt}"
                 ),
                 env=env,
                 timeout_sec=None,
             )
         ]
+
+    async def _export_lash_sessions(self, environment: BaseEnvironment) -> None:
+        export_dir = self.logs_dir / "lash-export"
+        export_dir.mkdir(parents=True, exist_ok=True)
+        command = f"""
+set -u
+for db in {shlex.quote(REMOTE_LASH_HOME)}/sessions/*.db; do
+  [ -e "$db" ] || continue
+  trace="${{db%.db}}.trace.jsonl"
+  [ -f "$trace" ] || continue
+  base="${{db%.db}}"
+  /installed-agent/lash --export "$db" --export-format json \
+    --export-trace "$trace" \
+    --export-out "${{base}}.export.json"
+done
+"""
+        (export_dir / "command.txt").write_text(command)
+        (export_dir / "metadata.json").write_text(
+            json.dumps(
+                {
+                    "phase": "postprocess",
+                    "purpose": "lash_session_export",
+                    "family": "lash",
+                    "is_main": False,
+                },
+                indent=2,
+            )
+            + "\n"
+        )
+        result = await environment.exec(
+            command=command,
+            env={
+                "HOME": REMOTE_HOME,
+                "LASH_HOME": REMOTE_LASH_HOME,
+                "SSL_CERT_FILE": REMOTE_CA_CERT_BUNDLE,
+                "CURL_CA_BUNDLE": REMOTE_CA_CERT_BUNDLE,
+                "REQUESTS_CA_BUNDLE": REMOTE_CA_CERT_BUNDLE,
+                "NODE_EXTRA_CA_CERTS": REMOTE_CA_CERT_BUNDLE,
+            },
+            timeout_sec=120,
+        )
+        (export_dir / "return-code.txt").write_text(str(result.return_code))
+        if result.stdout:
+            (export_dir / "stdout.txt").write_text(result.stdout)
+        if result.stderr:
+            (export_dir / "stderr.txt").write_text(result.stderr)
 
     async def run(
         self,
@@ -381,6 +400,19 @@ class LashAgent(BaseInstalledAgent):
                     self.logger.debug(
                         "Failed to download resource usage for command-%s", i, exc_info=True
                     )
+                try:
+                    await environment.download_file(
+                        source_path=f"/logs/agent/command-{i}/turn-usage.json",
+                        target_path=command_dir / "turn-usage.json",
+                    )
+                except Exception:  # pragma: no cover - best effort
+                    self.logger.debug(
+                        "Failed to download turn usage for command-%s", i, exc_info=True
+                    )
+            try:
+                await self._export_lash_sessions(environment)
+            except Exception:  # pragma: no cover - best effort
+                self.logger.warning("Failed to export lash sessions", exc_info=True)
         finally:
             await self._scrub_remote_secrets(environment)
             self._scrub_local_secrets()
@@ -407,7 +439,32 @@ class LashAgent(BaseInstalledAgent):
         n_cache_tokens = 0
         saw_usage = False
 
-        if sessions_dir.exists():
+        for path in sorted(self.logs_dir.glob("command-*/turn-usage.json")):
+            try:
+                data = json.loads(path.read_text())
+                entries = data.get("delta_entries")
+                if isinstance(entries, list) and entries:
+                    for entry in entries:
+                        if not isinstance(entry, dict):
+                            continue
+                        usage = entry.get("usage")
+                        if not isinstance(usage, dict):
+                            continue
+                        n_input_tokens += int(usage.get("input_tokens") or 0)
+                        n_output_tokens += int(usage.get("output_tokens") or 0)
+                        n_cache_tokens += int(usage.get("cached_input_tokens") or 0)
+                        saw_usage = True
+                    continue
+                usage = ((data.get("delta") or {}).get("usage") or {})
+                if isinstance(usage, dict):
+                    n_input_tokens += int(usage.get("input_tokens") or 0)
+                    n_output_tokens += int(usage.get("output_tokens") or 0)
+                    n_cache_tokens += int(usage.get("cached_input_tokens") or 0)
+                    saw_usage = True
+            except Exception as exc:  # pragma: no cover - defensive, non-fatal
+                self.logger.warning("Failed to parse lash turn usage from %s: %s", path, exc)
+
+        if not saw_usage and sessions_dir.exists():
             for path in sorted(sessions_dir.glob("*.trace.jsonl")):
                 try:
                     with path.open() as f:
@@ -421,7 +478,11 @@ class LashAgent(BaseInstalledAgent):
                                 continue
                             n_input_tokens += int(usage.get("input_tokens") or 0)
                             n_output_tokens += int(usage.get("output_tokens") or 0)
-                            n_cache_tokens += int(usage.get("cache_read_input_tokens") or 0)
+                            if "cached_input_tokens" in usage:
+                                n_cache_tokens += int(usage.get("cached_input_tokens") or 0)
+                            else:
+                                n_cache_tokens += int(usage.get("cache_read_input_tokens") or 0)
+                                n_cache_tokens += int(usage.get("cache_write_input_tokens") or 0)
                             saw_usage = True
                 except Exception as exc:  # pragma: no cover - defensive, non-fatal
                     self.logger.warning("Failed to parse lash usage from %s: %s", path, exc)

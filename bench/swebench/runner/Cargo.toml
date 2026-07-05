@@ -13,10 +13,15 @@ path = "src/main.rs"
 bench-common = { workspace = true }
 lash = { workspace = true }
 lash-core = { workspace = true }
+lash-cli = { workspace = true }
 lash-standard-plugins = { workspace = true }
 lash-sqlite-store = { workspace = true }
 lash-llm-tools = { workspace = true }
+lash-mode-rlm = { workspace = true }
+lash-mode-standard = { workspace = true }
 lash-plugin-observational-memory = { workspace = true }
+lash-plugin-rolling-history = { workspace = true }
+lash-providers-builtin = { workspace = true }
 lash-subagents = { workspace = true }
 tokio = { workspace = true, features = ["full"] }
 tokio-util = { workspace = true, features = ["rt"] }
@@ -27,3 +32,4 @@ serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }
 async-trait = { workspace = true }
 dotenvy = "0.15"
+dirs = { workspace = true }

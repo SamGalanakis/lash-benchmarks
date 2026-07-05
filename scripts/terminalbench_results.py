@@ -13,7 +13,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-SCHEMA_VERSION = 11
+SCHEMA_VERSION = 13
 
 PRESET_TASKS: dict[str, tuple[str, ...]] = {
     "trivial": ("log-summary-date-ranges",),
@@ -98,6 +98,7 @@ LOG_SINK_TEXT_SUFFIXES = {
     ".yml",
 }
 TERMINALBENCH_TASK_PREFIX = "terminal-bench/"
+TRANSCRIPT_JSON_SUFFIXES = (".export.json", ".transcript.json")
 REDACTED_SECRET = "[REDACTED]"
 SENSITIVE_KEY_NAMES = {
     "access_token",
@@ -218,8 +219,50 @@ def nested_str(value: Any, path: tuple[str, ...]) -> str | None:
     return None
 
 
+def nested_value(value: Any, path: tuple[str, ...]) -> Any:
+    current = value
+    for key in path:
+        if not isinstance(current, dict):
+            return None
+        current = current.get(key)
+    return current
+
+
+def int_usage_value(usage: dict[str, Any], *names: str) -> int:
+    for name in names:
+        value = usage.get(name)
+        if value is None:
+            continue
+        try:
+            return int(value)
+        except (TypeError, ValueError):
+            return 0
+    return 0
+
+
+def add_usage_totals(target: dict[str, int], usage: dict[str, Any]) -> None:
+    if "cached_input_tokens" in usage:
+        cache_read = int_usage_value(usage, "cached_input_tokens")
+        cache_write = 0
+    else:
+        cache_read = int_usage_value(usage, "cache_read_input_tokens", "cache_read")
+        cache_write = int_usage_value(usage, "cache_write_input_tokens", "cache_write")
+    target["raw_input"] += int_usage_value(usage, "input_tokens", "input")
+    target["output"] += int_usage_value(usage, "output_tokens", "output")
+    target["cache"] += cache_read + cache_write
+    target["cache_read"] += cache_read
+    target["cache_write"] += cache_write
+    target["reasoning"] += int_usage_value(
+        usage,
+        "reasoning_tokens",
+        "reasoning_output_tokens",
+        "reasoning",
+    )
+
+
 def trace_tool_name(record: dict[str, Any]) -> str | None:
     for path in (
+        ("event", "tool_name"),
         ("tool", "name"),
         ("tool_call", "name"),
         ("payload", "tool_name"),
@@ -231,6 +274,39 @@ def trace_tool_name(record: dict[str, Any]) -> str | None:
         if name:
             return name
     return None
+
+
+def trace_protocol_diagnostic(record: dict[str, Any]) -> tuple[str | None, dict[str, Any]]:
+    payload = record.get("payload")
+    if not isinstance(payload, dict):
+        return None, {}
+    diagnostic = payload.get("diagnostic")
+    if not isinstance(diagnostic, dict):
+        return None, {}
+    phase = diagnostic.get("phase")
+    diagnostic_payload = diagnostic.get("payload")
+    return (
+        phase if isinstance(phase, str) else None,
+        diagnostic_payload if isinstance(diagnostic_payload, dict) else {},
+    )
+
+
+def trace_protocol_iteration(record: dict[str, Any]) -> int | None:
+    context = record.get("context")
+    if not isinstance(context, dict):
+        return None
+    value = context.get("mode_iteration")
+    if not isinstance(value, int):
+        value = context.get("protocol_iteration")
+    return value if isinstance(value, int) else None
+
+
+def trace_turn_index(record: dict[str, Any]) -> int | None:
+    context = record.get("context")
+    if not isinstance(context, dict):
+        return None
+    value = context.get("turn_index")
+    return value if isinstance(value, int) else None
 
 
 def normalize_task_names(values: Any) -> list[str]:
@@ -335,6 +411,9 @@ def summarize_failure(
     command_stderr: str,
     reward: float | None,
 ) -> str | None:
+    if status == "pass":
+        return None
+
     if exception_info:
         exc_type = exception_info.get("exception_type") or "error"
         message = (
@@ -452,6 +531,165 @@ def safe_relative(path: Path, root: Path) -> str:
     return str(path.relative_to(root))
 
 
+def nested_value(value: Any, path: tuple[str, ...]) -> Any:
+    current = value
+    for key in path:
+        if not isinstance(current, dict):
+            return None
+        current = current.get(key)
+    return current
+
+
+def first_nested_str(value: Any, paths: tuple[tuple[str, ...], ...]) -> tuple[str | None, str | None]:
+    for path in paths:
+        candidate = nested_value(value, path)
+        if isinstance(candidate, str) and candidate.strip():
+            return candidate.strip(), ".".join(path)
+    return None, None
+
+
+def find_first_str_key(value: Any, key_names: set[str]) -> tuple[str | None, str | None]:
+    if isinstance(value, dict):
+        for key, item in value.items():
+            normalized_key = str(key).replace("-", "_").lower()
+            if normalized_key in key_names and isinstance(item, str) and item.strip():
+                return item.strip(), str(key)
+        for key, item in value.items():
+            found, source = find_first_str_key(item, key_names)
+            if found:
+                return found, f"{key}.{source}" if source else str(key)
+    elif isinstance(value, list):
+        for index, item in enumerate(value):
+            found, source = find_first_str_key(item, key_names)
+            if found:
+                return found, f"{index}.{source}" if source else str(index)
+    return None, None
+
+
+def parse_docker_image_from_log(text: str) -> tuple[str | None, str | None]:
+    patterns = (
+        (
+            re.compile(r"Skipping image OS validation for (?P<image>\S+): docker inspect"),
+            "trial_log.os_validation",
+        ),
+        (
+            re.compile(r"(?:Using|Pulling|Pulled|Inspecting) (?:prebuilt )?(?:Docker )?image (?P<image>\S+)", re.IGNORECASE),
+            "trial_log.image_message",
+        ),
+        (
+            re.compile(r"Successfully tagged (?P<image>\S+)", re.IGNORECASE),
+            "trial_log.docker_tag",
+        ),
+    )
+    for pattern, source in patterns:
+        match = pattern.search(text)
+        if match:
+            return match.group("image").rstrip(",.;"), source
+    return None, None
+
+
+def load_job_image_map(job_log_path: Path) -> dict[str, str]:
+    task_images: dict[str, str] = {}
+    if not job_log_path.exists():
+        return task_images
+    for line in job_log_path.read_text(errors="replace").splitlines():
+        image, _source = parse_docker_image_from_log(line)
+        if not image:
+            continue
+        image_name = image.rsplit("/", 1)[-1].split(":", 1)[0]
+        if image_name:
+            task_images.setdefault(display_task_name(image_name), image)
+    return task_images
+
+
+def build_image_parity_metadata(
+    config: dict[str, Any],
+    trial_log: str,
+    *,
+    task_name: str | None = None,
+    job_image_map: dict[str, str] | None = None,
+) -> dict[str, Any]:
+    task_config = config.get("task") if isinstance(config.get("task"), dict) else {}
+    env_config = config.get("environment") if isinstance(config.get("environment"), dict) else {}
+    upstream_image, upstream_source = first_nested_str(
+        task_config,
+        (
+            ("docker_image",),
+            ("dockerImage",),
+            ("image",),
+            ("metadata", "docker_image"),
+            ("metadata", "dockerImage"),
+        ),
+    )
+    if not upstream_image:
+        upstream_image, upstream_source = find_first_str_key(
+            task_config,
+            {"docker_image", "dockerimage"},
+        )
+    actual_image, actual_source = first_nested_str(
+        env_config,
+        (
+            ("actual_image",),
+            ("actual_docker_image",),
+            ("resolved_image",),
+            ("resolved_docker_image",),
+            ("container_image",),
+            ("docker_image",),
+            ("image",),
+            ("kwargs", "actual_image"),
+            ("kwargs", "actual_docker_image"),
+            ("kwargs", "docker_image"),
+            ("kwargs", "image"),
+        ),
+    )
+    if actual_source:
+        actual_source = f"environment.{actual_source}"
+
+    log_image, log_source = parse_docker_image_from_log(trial_log)
+    if not upstream_image and log_image:
+        upstream_image = log_image
+        upstream_source = log_source
+    if not actual_image and log_image:
+        actual_image = log_image
+        actual_source = log_source
+
+    mapped_image = (job_image_map or {}).get(display_task_name(task_name or ""))
+    if not upstream_image and mapped_image:
+        upstream_image = mapped_image
+        upstream_source = "job_log.task_image"
+    if not actual_image and mapped_image:
+        actual_image = mapped_image
+        actual_source = "job_log.task_image"
+
+    raw_force_build = env_config.get("force_build")
+    force_build = raw_force_build if isinstance(raw_force_build, bool) else None
+    local_build_log_hint = bool(
+        re.search(r"\b(?:docker build|building docker image|building image)\b", trial_log, re.IGNORECASE)
+    )
+    if force_build is True or local_build_log_hint:
+        harbor_image_source = "local_build"
+    elif force_build is False and (actual_image or upstream_image):
+        harbor_image_source = "prebuilt"
+    else:
+        harbor_image_source = "unknown"
+
+    return {
+        "upstream_docker_image": upstream_image,
+        "upstream_docker_image_source": upstream_source,
+        "actual_image": actual_image,
+        "actual_image_source": actual_source,
+        "force_build": force_build,
+        "harbor_image_source": harbor_image_source,
+        "harbor_image_source_basis": (
+            "environment.force_build"
+            if force_build is not None
+            else "trial_log"
+            if local_build_log_hint or log_image
+            else None
+        ),
+    }
+
+
 def load_provider_metadata(config_path: Path | None) -> dict[str, Any]:
     if not config_path or not config_path.exists():
         return {"active_provider": None, "active_provider_type": None, "available_providers": []}
@@ -494,34 +732,43 @@ def load_llm_metadata(llm_paths: list[Path]) -> dict[str, Any]:
 
     * `record_count`   — every line in the typed runtime trace
     * `call_count`     — number of completed LLM request/response cycles
-    * `turn_count`     — distinct `context.iteration` indexes seen
+    * `turn_count`     — distinct RLM protocol iterations with completed calls
     * token totals     — summed from the summary rows' `usage` blocks
-
-    Prior to this split the dashboard conflated deltas with calls, showing
-    "1,302 LLM CALLS" for what was really a 3-turn session.
     """
     models: list[str] = []
     record_count = 0
     call_count = 0
-    turns: set[int] = set()
+    iterations: set[int] = set()
+    turn_indexes: set[int] = set()
     files: list[dict[str, Any]] = []
     token_totals = {
         "raw_input": 0,
         "output": 0,
         "cache": 0,
+        "cache_read": 0,
+        "cache_write": 0,
         "reasoning": 0,
     }
     usage_record_count = 0
     tool_call_count = 0
+    explicit_tool_call_count = 0
+    stream_tool_call_count = 0
+    protocol_tool_call_count = 0
     batch_call_count = 0
     tool_call_breakdown: dict[str, int] = defaultdict(int)
     for llm_path in llm_paths:
         file_record_count = 0
         file_call_count = 0
-        file_tool_call_count = 0
+        file_explicit_tool_call_count = 0
+        file_stream_tool_call_count = 0
+        file_protocol_tool_call_count = 0
+        file_batch_call_count = 0
         file_tool_call_breakdown: dict[str, int] = defaultdict(int)
+        file_stream_tool_call_breakdown: dict[str, int] = defaultdict(int)
+        file_stream_tool_call_ids: set[str] = set()
         file_models: list[str] = []
-        file_turns: set[int] = set()
+        file_iterations: set[int] = set()
+        file_turn_indexes: set[int] = set()
         for line in llm_path.read_text(errors="replace").splitlines():
             line = line.strip()
             if not line:
@@ -537,27 +784,43 @@ def load_llm_metadata(llm_paths: list[Path]) -> dict[str, Any]:
             if is_summary_call:
                 call_count += 1
                 file_call_count += 1
-            if record_type == "tool_call_started":
+                iteration = trace_protocol_iteration(record)
+                if iteration is not None:
+                    iterations.add(iteration)
+                    file_iterations.add(iteration)
+                turn_index = trace_turn_index(record)
+                if turn_index is not None:
+                    turn_indexes.add(turn_index)
+                    file_turn_indexes.add(turn_index)
+            if record_type == "protocol_step":
+                phase, diagnostic_payload = trace_protocol_diagnostic(record)
+                if phase == "exec_code_completed":
+                    count = int(diagnostic_payload.get("tool_call_count") or 0)
+                    if count > 0:
+                        file_protocol_tool_call_count += count
+            elif record_type == "tool_call_started":
                 name = trace_tool_name(record)
                 if name:
-                    tool_call_count += 1
-                    file_tool_call_count += 1
-                    tool_call_breakdown[name] += 1
+                    file_explicit_tool_call_count += 1
                     file_tool_call_breakdown[name] += 1
                     if name == "batch":
-                        batch_call_count += 1
+                        file_batch_call_count += 1
+            elif record_type == "runtime_stream_event":
+                event = record.get("event")
+                if isinstance(event, dict) and event.get("event_name") == "tool_call_part":
+                    name = trace_tool_name(record)
+                    call_id = event.get("call_id")
+                    key = call_id if isinstance(call_id, str) and call_id else f"{record_count}:{name}"
+                    if name and key not in file_stream_tool_call_ids:
+                        file_stream_tool_call_ids.add(key)
+                        file_stream_tool_call_count += 1
+                        file_stream_tool_call_breakdown[name] += 1
+                        if name == "batch":
+                            file_batch_call_count += 1
             usage = record.get("usage")
-            if isinstance(usage, dict):
-                token_totals["raw_input"] += int(usage.get("input_tokens") or 0)
-                token_totals["output"] += int(usage.get("output_tokens") or 0)
-                token_totals["cache"] += int(usage.get("cache_read_input_tokens") or 0)
-                token_totals["reasoning"] += int(usage.get("reasoning_output_tokens") or 0)
+            if record_type == "llm_call_completed" and isinstance(usage, dict):
+                add_usage_totals(token_totals, usage)
                 usage_record_count += 1
-            context = record.get("context") if isinstance(record.get("context"), dict) else {}
-            turn = context.get("iteration")
-            if isinstance(turn, int):
-                turns.add(turn)
-                file_turns.add(turn)
             if record_type == "llm_call_started":
                 request = record.get("request")
                 if not isinstance(request, dict):
@@ -567,28 +830,139 @@ def load_llm_metadata(llm_paths: list[Path]) -> dict[str, Any]:
                     models.append(model)
                 if isinstance(model, str) and model not in file_models:
                     file_models.append(model)
+        file_tool_call_count = (
+            file_explicit_tool_call_count
+            or file_stream_tool_call_count
+            or file_protocol_tool_call_count
+        )
+        tool_call_count += file_tool_call_count
+        explicit_tool_call_count += file_explicit_tool_call_count
+        stream_tool_call_count += file_stream_tool_call_count
+        protocol_tool_call_count += file_protocol_tool_call_count
+        batch_call_count += file_batch_call_count
+        breakdown = (
+            file_tool_call_breakdown
+            if file_explicit_tool_call_count
+            else file_stream_tool_call_breakdown
+        )
+        for name, count in breakdown.items():
+            tool_call_breakdown[name] += count
         files.append(
             {
                 "name": llm_path.name,
                 "record_count": file_record_count,
                 "call_count": file_call_count,
                 "tool_call_count": file_tool_call_count,
-                "tool_call_breakdown": dict(sorted(file_tool_call_breakdown.items())),
-                "turn_count": len(file_turns),
+                "tool_call_breakdown": dict(sorted(breakdown.items())),
+                "tool_call_count_source": (
+                    "trace_tool_events"
+                    if file_explicit_tool_call_count
+                    else "runtime_stream_tool_events"
+                    if file_stream_tool_call_count
+                    else "rlm_protocol_summary"
+                    if file_protocol_tool_call_count
+                    else None
+                ),
+                "turn_count": len(file_iterations) or len(file_turn_indexes),
                 "models": file_models,
             }
         )
     return {
         "record_count": record_count,
         "call_count": call_count,
-        "turn_count": len(turns),
+        "turn_count": len(iterations) or len(turn_indexes),
         "models": models,
         "files": files,
         "usage_record_count": usage_record_count,
         "tool_call_count": tool_call_count,
         "batch_call_count": batch_call_count,
         "tool_call_breakdown": dict(sorted(tool_call_breakdown.items())),
+        "tool_call_count_source": (
+            "trace_tool_events"
+            if explicit_tool_call_count
+            else "runtime_stream_tool_events"
+            if stream_tool_call_count
+            else "rlm_protocol_summary"
+            if protocol_tool_call_count
+            else None
+        ),
         "tokens": token_totals,
+    }
+
+
+def load_turn_usage_metadata(paths: list[Path]) -> dict[str, Any]:
+    tokens = {
+        "raw_input": 0,
+        "output": 0,
+        "cache": 0,
+        "cache_read": 0,
+        "cache_write": 0,
+        "reasoning": 0,
+    }
+    models: list[str] = []
+    sources: dict[str, int] = defaultdict(int)
+    files: list[dict[str, Any]] = []
+    usage_record_count = 0
+    fallback_count = 0
+
+    def add_model(value: Any) -> None:
+        if isinstance(value, str) and value and value not in models:
+            models.append(value)
+
+    for path in paths:
+        if not path.exists():
+            continue
+        try:
+            data = json.loads(path.read_text())
+        except (OSError, json.JSONDecodeError):
+            continue
+
+        file_records = 0
+        entries = data.get("delta_entries")
+        if isinstance(entries, list) and entries:
+            for entry in entries:
+                if not isinstance(entry, dict):
+                    continue
+                usage = entry.get("usage")
+                if not isinstance(usage, dict):
+                    continue
+                add_usage_totals(tokens, usage)
+                add_model(entry.get("model"))
+                source = entry.get("source")
+                if isinstance(source, str) and source:
+                    sources[source] += 1
+                usage_record_count += 1
+                file_records += 1
+        else:
+            usage = nested_value(data, ("delta", "usage"))
+            if isinstance(usage, dict):
+                add_usage_totals(tokens, usage)
+                usage_record_count += 1
+                file_records += 1
+
+        by_source_model = nested_value(data, ("delta", "by_source_model"))
+        if isinstance(by_source_model, list):
+            for row in by_source_model:
+                if isinstance(row, dict):
+                    add_model(row.get("model"))
+
+        if data.get("delta_is_fallback") is True:
+            fallback_count += 1
+        files.append(
+            {
+                "name": path.name,
+                "usage_record_count": file_records,
+                "delta_is_fallback": data.get("delta_is_fallback") is True,
+            }
+        )
+
+    return {
+        "usage_record_count": usage_record_count,
+        "fallback_count": fallback_count,
+        "models": models,
+        "source_counts": dict(sorted(sources.items())),
+        "files": files,
+        "tokens": tokens,
     }
 
 
@@ -864,8 +1238,12 @@ def _load_codex_metadata(codex_path: Path | None) -> dict[str, Any]:
             usage = record.get("usage") or {}
             tokens["input"] += int(usage.get("input_tokens") or 0)
             tokens["output"] += int(usage.get("output_tokens") or 0)
-            tokens["reasoning"] += int(usage.get("reasoning_output_tokens") or 0)
-            cached = int(usage.get("cache_read_input_tokens") or 0)
+            tokens["reasoning"] += int(
+                usage.get("reasoning_tokens") or usage.get("reasoning_output_tokens") or 0
+            )
+            cached = int(
+                usage.get("cached_input_tokens") or usage.get("cache_read_input_tokens") or 0
+            )
             tokens["cache"] += cached
             tokens["cache_read"] += cached
             total = tokens["input"] + tokens["output"]
@@ -1160,6 +1538,192 @@ def copy_directory_artifacts(src_dir: Path, dst_dir: Path, run_dir: Path) -> lis
     return copied
 
 
+def artifact_paths(
+    artifacts: list[dict[str, Any]],
+    predicate: Any,
+) -> list[str]:
+    paths: list[str] = []
+    for item in artifacts:
+        if not isinstance(item, dict) or not predicate(str(item.get("name") or "")):
+            continue
+        path = item.get("path")
+        if isinstance(path, str) and path:
+            paths.append(path)
+    return paths
+
+
+def command_artifact_paths(command_records: list[dict[str, Any]], key: str) -> list[str]:
+    return [
+        value
+        for record in command_records
+        for value in [record.get(key)]
+        if isinstance(value, str) and value
+    ]
+
+
+def artifact_check(
+    *,
+    required: bool,
+    paths: list[str],
+    note: str | None = None,
+) -> dict[str, Any]:
+    check: dict[str, Any] = {
+        "required": required,
+        "present": bool(paths),
+        "count": len(paths),
+        "paths": paths,
+    }
+    if note:
+        check["note"] = note
+    return check
+
+
+def build_artifact_completeness(
+    *,
+    agent: str,
+    copied_artifacts: dict[str, str],
+    command_records: list[dict[str, Any]],
+    session_artifacts: list[dict[str, Any]],
+    verifier_artifacts: list[dict[str, Any]],
+    lash_export_artifacts: list[dict[str, Any]],
+) -> dict[str, Any]:
+    is_lash = agent == "lash"
+    session_paths_by_name = {
+        str(item.get("name")): str(item.get("path"))
+        for item in session_artifacts
+        if isinstance(item, dict)
+        and isinstance(item.get("name"), str)
+        and isinstance(item.get("path"), str)
+    }
+    db_by_base = {
+        name.removesuffix(".db"): path
+        for name, path in session_paths_by_name.items()
+        if name.endswith(".db") and ".db." not in name
+    }
+    trace_by_base = {
+        name.removesuffix(".trace.jsonl"): path
+        for name, path in session_paths_by_name.items()
+        if name.endswith(".trace.jsonl")
+    }
+    transcript_by_base = {
+        name.removesuffix(suffix): path
+        for name, path in session_paths_by_name.items()
+        for suffix in TRANSCRIPT_JSON_SUFFIXES
+        if name.endswith(suffix)
+    }
+    session_bases = sorted(set(trace_by_base) | set(transcript_by_base))
+    if not session_bases:
+        session_bases = sorted(db_by_base)
+    session_pairs = [
+        {
+            "session": base,
+            "db": db_by_base.get(base),
+            "trace_jsonl": trace_by_base.get(base),
+            "transcript_json": transcript_by_base.get(base),
+            "complete": bool(
+                db_by_base.get(base)
+                and trace_by_base.get(base)
+                and transcript_by_base.get(base)
+            ),
+        }
+        for base in session_bases
+    ]
+
+    verifier_stdout_paths = [
+        path
+        for path in [copied_artifacts.get("verifier_stdout")]
+        if isinstance(path, str) and path
+    ] or artifact_paths(verifier_artifacts, lambda name: name == "test-stdout.txt")
+    verifier_stderr_paths = [
+        path
+        for path in [copied_artifacts.get("verifier_stderr")]
+        if isinstance(path, str) and path
+    ] or artifact_paths(verifier_artifacts, lambda name: name == "test-stderr.txt")
+    verifier_reward_paths = [
+        path
+        for path in [copied_artifacts.get("verifier_reward")]
+        if isinstance(path, str) and path
+    ] or artifact_paths(verifier_artifacts, lambda name: name == "reward.txt")
+    verifier_log_paths = artifact_paths(verifier_artifacts, lambda _name: True)
+    lash_export_log_paths = artifact_paths(lash_export_artifacts, lambda _name: True)
+
+    checks = {
+        "lash_session_db": artifact_check(
+            required=is_lash,
+            paths=[pair["db"] for pair in session_pairs if isinstance(pair.get("db"), str)],
+        ),
+        "lash_trace_jsonl": artifact_check(
+            required=is_lash,
+            paths=[
+                pair["trace_jsonl"]
+                for pair in session_pairs
+                if isinstance(pair.get("trace_jsonl"), str)
+            ],
+        ),
+        "lash_transcript_json": artifact_check(
+            required=is_lash,
+            paths=[
+                pair["transcript_json"]
+                for pair in session_pairs
+                if isinstance(pair.get("transcript_json"), str)
+            ],
+        ),
+        "turn_usage_json": artifact_check(
+            required=is_lash,
+            paths=command_artifact_paths(command_records, "turn_usage_path"),
+        ),
+        "agent_stdout": artifact_check(
+            required=True,
+            paths=command_artifact_paths(command_records, "stdout"),
+        ),
+        "agent_stderr": artifact_check(
+            required=False,
+            paths=command_artifact_paths(command_records, "stderr"),
+            note="Harbor only writes stderr artifacts when the stream is non-empty.",
+        ),
+        "verifier_reward": artifact_check(required=True, paths=verifier_reward_paths),
+        "verifier_stdout": artifact_check(required=True, paths=verifier_stdout_paths),
+        "verifier_stderr": artifact_check(
+            required=False,
+            paths=verifier_stderr_paths,
+            note="Verifier stderr may be absent when the stream is empty.",
+        ),
+        "verifier_logs": artifact_check(required=True, paths=verifier_log_paths),
+        "lash_session_export_logs": artifact_check(
+            required=False,
+            paths=lash_export_log_paths,
+            note="Post-run transcript export command logs, when produced by LashAgent.",
+        ),
+    }
+    missing_required = [
+        name
+        for name, check in checks.items()
+        if check.get("required") and not check.get("present")
+    ]
+    native_missing = [
+        name
+        for name in (
+            "lash_session_db",
+            "lash_trace_jsonl",
+            "lash_transcript_json",
+            "turn_usage_json",
+        )
+        if name in missing_required
+    ]
+    return {
+        "schema_version": 1,
+        "complete": not missing_required,
+        "missing_required": missing_required,
+        "checks": checks,
+        "native_lash": {
+            "applicable": is_lash,
+            "complete": is_lash and not native_missing,
+            "missing_required": native_missing,
+            "sessions": session_pairs,
+        },
+    }
+
+
 def append_jsonl(path: Path, records: list[dict[str, Any]]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("w") as handle:
@@ -1236,6 +1800,8 @@ def write_trial_log_sink(
     command_records: list[dict[str, Any]],
     setup_record: dict[str, str],
     session_artifacts: list[dict[str, Any]],
+    verifier_artifacts: list[dict[str, Any]],
+    lash_export_artifacts: list[dict[str, Any]],
 ) -> str:
     relative_paths: list[str] = []
     seen: set[str] = set()
@@ -1249,11 +1815,23 @@ def write_trial_log_sink(
     for value in copied_artifacts.values():
         add_path(value)
     for record in command_records:
-        for key in ("command", "stdout", "stderr", "return_code", "metadata_path", "resource_usage_path"):
+        for key in (
+            "command",
+            "stdout",
+            "stderr",
+            "return_code",
+            "metadata_path",
+            "resource_usage_path",
+            "turn_usage_path",
+        ):
             add_path(record.get(key))
     for value in setup_record.values():
         add_path(value)
     for item in session_artifacts:
+        add_path(item.get("path"))
+    for item in verifier_artifacts:
+        add_path(item.get("path"))
+    for item in lash_export_artifacts:
         add_path(item.get("path"))
 
     sink_records: list[dict[str, Any]] = []
@@ -1405,6 +1983,7 @@ def build_trial_record(
     trial_dir: Path,
     run_dir: Path,
     args: ExportArgs,
+    job_image_map: dict[str, str] | None = None,
 ) -> dict[str, Any]:
     preset, preset_source = resolve_preset(args.preset, args.exact_tasks)
     result = load_json(trial_dir / "result.json")
@@ -1416,14 +1995,14 @@ def build_trial_record(
     verifier_result = result.get("verifier_result") or {}
     exception_info = result.get("exception_info") or None
     reward = (verifier_result.get("rewards") or {}).get("reward")
-    if exception_info:
-        status = "error"
-    elif reward == 1 or reward == 1.0:
-        status = "pass"
+    official_score = float(reward) if isinstance(reward, (float, int)) else None
+    if reward == 1 or reward == 1.0:
+        official_status = "pass"
     elif reward is None:
-        status = "no-reward"
+        official_status = "no-reward"
     else:
-        status = "fail"
+        official_status = "fail"
+    status = "error" if exception_info else official_status
 
     provider_metadata = load_provider_metadata(args.provider_config)
     raw_agent_tokens = {
@@ -1470,6 +2049,8 @@ def build_trial_record(
         "exception_txt": trial_dir / "exception.txt",
         "verifier_reward": trial_dir / "verifier" / "reward.txt",
         "verifier_stdout": trial_dir / "verifier" / "test-stdout.txt",
+        "verifier_stderr": trial_dir / "verifier" / "test-stderr.txt",
+        "verifier_ctrf": trial_dir / "verifier" / "ctrf.json",
         "trajectory_json": trajectory_path,
         "opencode_raw": agent_dir / "opencode.txt",
         "codex_raw": agent_dir / "codex.txt",
@@ -1504,6 +2085,7 @@ def build_trial_record(
             ("return_code", "return-code.txt"),
             ("metadata_path", "metadata.json"),
             ("resource_usage_path", "resource-usage.txt"),
+            ("turn_usage_path", "turn-usage.json"),
         ):
             src = command_dir / filename
             if not src.exists():
@@ -1517,6 +2099,10 @@ def build_trial_record(
         record["metadata"] = metadata
         command_records.append(record)
 
+    turn_usage_metadata = load_turn_usage_metadata(
+        [command_dir / "turn-usage.json" for command_dir in command_dirs]
+    )
+
     setup_record: dict[str, str] = {}
     for label, filename in (("stdout", "stdout.txt"), ("stderr", "stderr.txt"), ("return_code", "return-code.txt")):
         src = trial_dir / "agent" / "setup" / filename
@@ -1528,6 +2114,16 @@ def build_trial_record(
 
     sessions_dir = lash_home_dir / "sessions"
     session_artifacts = copy_directory_artifacts(sessions_dir, artifacts_dir / "sessions", run_dir)
+    verifier_artifacts = copy_directory_artifacts(
+        trial_dir / "verifier",
+        artifacts_dir / "verifier",
+        run_dir,
+    )
+    lash_export_artifacts = copy_directory_artifacts(
+        agent_dir / "lash-export",
+        artifacts_dir / "lash-export",
+        run_dir,
+    )
     llm_candidates = sorted(sessions_dir.glob("*.trace.jsonl"))
     llm_metadata = (
         load_llm_metadata(llm_candidates)
@@ -1543,8 +2139,13 @@ def build_trial_record(
                 "raw_input": 0,
                 "output": 0,
                 "cache": 0,
+                "cache_read": 0,
+                "cache_write": 0,
                 "reasoning": 0,
             },
+            "tool_call_count": 0,
+            "batch_call_count": 0,
+            "tool_call_breakdown": {},
         }
     )
     session_db_candidates = sorted(sessions_dir.glob("*.db"))
@@ -1582,7 +2183,11 @@ def build_trial_record(
         output=raw_agent_tokens["output"],
         reasoning=0,
         cache_total=raw_agent_tokens["cache"],
-        input_includes_cache=token_input_includes_cache(provider_metadata, args.requested_model),
+        input_includes_cache=(
+            False
+            if args.agent == "lash"
+            else token_input_includes_cache(provider_metadata, args.requested_model)
+        ),
     )
     if args.agent == "opencode" and (agent_dir / "opencode.txt").exists():
         opencode_tokens = opencode_metadata["tokens"]
@@ -1610,6 +2215,18 @@ def build_trial_record(
             cache_write=int(codex_tokens.get("cache_write") or 0),
         )
         token_source = "codex_log"
+    elif args.agent == "lash" and int(turn_usage_metadata.get("usage_record_count") or 0) > 0:
+        turn_usage_tokens = turn_usage_metadata.get("tokens") or {}
+        token_details = normalize_token_usage(
+            raw_input=int(turn_usage_tokens.get("raw_input") or 0),
+            output=int(turn_usage_tokens.get("output") or 0),
+            reasoning=int(turn_usage_tokens.get("reasoning") or 0),
+            cache_total=int(turn_usage_tokens.get("cache") or 0),
+            input_includes_cache=False,
+            cache_read=int(turn_usage_tokens.get("cache_read") or 0),
+            cache_write=int(turn_usage_tokens.get("cache_write") or 0),
+        )
+        token_source = "lash_turn_usage"
     elif int(llm_metadata.get("usage_record_count") or 0) > 0:
         llm_tokens = llm_metadata.get("tokens") or {}
         token_details = normalize_token_usage(
@@ -1617,9 +2234,9 @@ def build_trial_record(
             output=int(llm_tokens.get("output") or 0),
             reasoning=int(llm_tokens.get("reasoning") or 0),
             cache_total=int(llm_tokens.get("cache") or 0),
-            input_includes_cache=token_input_includes_cache(
-                provider_metadata, args.requested_model
-            ),
+            input_includes_cache=False,
+            cache_read=int(llm_tokens.get("cache_read") or 0),
+            cache_write=int(llm_tokens.get("cache_write") or 0),
         )
         token_source = "lash_trace"
     elif raw_agent_tokens["total"] > 0:
@@ -1637,9 +2254,11 @@ def build_trial_record(
     }
     resolved_models: list[str] = []
     for model in [
+        *turn_usage_metadata["models"],
         *llm_metadata["models"],
         *trajectory_metadata["models"],
         *opencode_metadata["models"],
+        *codex_metadata["models"],
     ]:
         if isinstance(model, str) and model and model not in resolved_models:
             resolved_models.append(model)
@@ -1676,6 +2295,7 @@ def build_trial_record(
     }
 
     verifier_stdout = read_text(trial_dir / "verifier" / "test-stdout.txt")
+    trial_log = read_text(trial_dir / "trial.log")
     command_stdout = ""
     command_stderr = ""
     primary_command = next(
@@ -1715,6 +2335,12 @@ def build_trial_record(
     if not isinstance(raw_task_name, str) or not raw_task_name.strip():
         raw_task_name = trial_dir.name
     task_name = display_task_name(raw_task_name)
+    image_parity = build_image_parity_metadata(
+        config,
+        trial_log,
+        task_name=task_name,
+        job_image_map=job_image_map,
+    )
     copied_artifacts["log_sink_jsonl"] = write_trial_log_sink(
         run_dir=run_dir,
         artifacts_dir=artifacts_dir,
@@ -1724,18 +2350,32 @@ def build_trial_record(
         command_records=command_records,
         setup_record=setup_record,
         session_artifacts=session_artifacts,
+        verifier_artifacts=verifier_artifacts,
+        lash_export_artifacts=lash_export_artifacts,
     )
+    artifact_completeness = build_artifact_completeness(
+        agent=args.agent,
+        copied_artifacts=copied_artifacts,
+        command_records=command_records,
+        session_artifacts=session_artifacts,
+        verifier_artifacts=verifier_artifacts,
+        lash_export_artifacts=lash_export_artifacts,
+    )
+    agent_cost_usd = agent_result.get("cost_usd")
 
     return {
         "trial_name": trial_name,
         "task_name": task_name,
         "task_source": result.get("source"),
         "status": status,
-        "reward": float(reward) if isinstance(reward, (float, int)) else None,
+        "official_status": official_status,
+        "reward": official_score,
+        "official_score": official_score,
         "timing": timing,
         "duration_display": format_duration(timing["trial_seconds"]),
         "tokens": tokens,
-        "cost_usd": agent_result.get("cost_usd"),
+        "cost_usd": agent_cost_usd,
+        "agent_cost_usd": agent_cost_usd,
         "resource_usage": resource_usage,
         "metadata": {
             "agent": args.agent,
@@ -1748,9 +2388,31 @@ def build_trial_record(
             "variant": args.variant or None,
             "context_approach": args.context_approach or None,
             "provider": provider_metadata,
+            "image_parity": image_parity,
             "task_path": ((result.get("task_id") or {}).get("path")),
             "task_git_url": ((result.get("task_id") or {}).get("git_url")),
             "task_git_commit_id": ((result.get("task_id") or {}).get("git_commit_id")),
+            "official_scoring": {
+                "score_source": "verifier_result.rewards.reward",
+                "status_source": "verifier_result.rewards.reward",
+                "uses_llm_judgement": False,
+                "auxiliary_analysis_affects_score": False,
+                "harness_error_status_field": "status",
+            },
+            "cost_accounting": {
+                "cost_usd_field": "agent_cost_usd",
+                "legacy_alias": "cost_usd",
+                "source": "agent_result.cost_usd",
+                "scope": "agent_only",
+                "includes_verifier_cost": False,
+                "includes_export_dashboard_analysis_cost": False,
+            },
+            "analysis_accounting": {
+                "auxiliary_analysis_present": False,
+                "official_scoring_uses_auxiliary_analysis": False,
+                "openrouter_allowed_scope": "auxiliary_analysis_only",
+                "auxiliary_analysis_cost_usd": None,
+            },
             "llm_request_count": activity_metadata["llm_call_count"],
             "llm_record_count": activity_metadata["llm_record_count"],
             "llm_turn_count": activity_metadata["llm_turn_count"],
@@ -1759,6 +2421,7 @@ def build_trial_record(
             "tool_batch_count": activity_metadata["batch_call_count"],
             "tool_call_breakdown": activity_metadata["tool_call_breakdown"],
             "llm_trace_files": llm_metadata["files"],
+            "turn_usage_files": turn_usage_metadata["files"],
             "assistant_response_present": bool(assistant_response),
             "token_accounting": {
                 "source": token_source,
@@ -1768,6 +2431,9 @@ def build_trial_record(
                 "non_cache_total": token_details["non_cache_total"],
                 "cache_read": token_details["cache_read"],
                 "cache_write": token_details["cache_write"],
+                "turn_usage_record_count": turn_usage_metadata["usage_record_count"],
+                "turn_usage_fallback_count": turn_usage_metadata["fallback_count"],
+                "turn_usage_source_counts": turn_usage_metadata["source_counts"],
             },
             "environment": {
                 "type": ((config.get("environment") or {}).get("type")),
@@ -1786,13 +2452,81 @@ def build_trial_record(
             "commands": command_records,
             "setup": setup_record,
             "sessions": session_artifacts,
+            "verifier": verifier_artifacts,
+            "lash_export": lash_export_artifacts,
+            "completeness": artifact_completeness,
         },
+    }
+
+
+def build_artifact_completeness_summary(trials: list[dict[str, Any]]) -> dict[str, Any]:
+    missing_counts: dict[str, int] = defaultdict(int)
+    complete_trials = 0
+    native_applicable = 0
+    native_complete = 0
+
+    for trial in trials:
+        completeness = ((trial.get("artifacts") or {}).get("completeness") or {})
+        if completeness.get("complete"):
+            complete_trials += 1
+        for name in completeness.get("missing_required") or []:
+            if isinstance(name, str):
+                missing_counts[name] += 1
+        native = completeness.get("native_lash") or {}
+        if native.get("applicable"):
+            native_applicable += 1
+            if native.get("complete"):
+                native_complete += 1
+
+    return {
+        "schema_version": 1,
+        "trials_total": len(trials),
+        "complete_trials": complete_trials,
+        "incomplete_trials": len(trials) - complete_trials,
+        "native_lash_applicable_trials": native_applicable,
+        "native_lash_complete_trials": native_complete,
+        "native_lash_incomplete_trials": native_applicable - native_complete,
+        "missing_required_counts": dict(sorted(missing_counts.items())),
+    }
+
+
+def unique_values(values: list[Any]) -> list[Any]:
+    unique: list[Any] = []
+    seen: set[str] = set()
+    for value in values:
+        if value is None:
+            continue
+        key = json.dumps(value, sort_keys=True)
+        if key in seen:
+            continue
+        seen.add(key)
+        unique.append(value)
+    return sorted(unique, key=lambda item: str(item))
+
+
+def build_image_parity_rollup(trials: list[dict[str, Any]]) -> dict[str, Any]:
+    image_records = [
+        (trial.get("metadata") or {}).get("image_parity") or {}
+        for trial in trials
+    ]
+    return {
+        "schema_version": 1,
+        "upstream_docker_images": unique_values(
+            [record.get("upstream_docker_image") for record in image_records]
+        ),
+        "actual_images": unique_values([record.get("actual_image") for record in image_records]),
+        "force_build_values": unique_values([record.get("force_build") for record in image_records]),
+        "harbor_image_sources": unique_values(
+            [record.get("harbor_image_source") for record in image_records]
+        ),
     }
 
 
 def build_global_stats(trials: list[dict[str, Any]]) -> dict[str, Any]:
     statuses = defaultdict(int)
+    official_statuses = defaultdict(int)
     rewards: list[float] = []
+    agent_costs: list[float] = []
     trial_seconds: list[float] = []
     agent_exec_seconds: list[float] = []
     total_tokens = {
@@ -1814,9 +2548,16 @@ def build_global_stats(trials: list[dict[str, Any]]) -> dict[str, Any]:
     }
     for trial in trials:
         statuses[trial["status"]] += 1
+        official_status = trial.get("official_status")
+        if not isinstance(official_status, str) or not official_status:
+            official_status = trial["status"]
+        official_statuses[official_status] += 1
         reward = trial.get("reward")
         if isinstance(reward, (float, int)):
             rewards.append(float(reward))
+        agent_cost = trial.get("agent_cost_usd")
+        if isinstance(agent_cost, (float, int)):
+            agent_costs.append(float(agent_cost))
         duration = (trial.get("timing") or {}).get("trial_seconds")
         if isinstance(duration, (float, int)):
             trial_seconds.append(float(duration))
@@ -1834,6 +2575,7 @@ def build_global_stats(trials: list[dict[str, Any]]) -> dict[str, Any]:
 
     trial_count = len(trials)
     passed = statuses["pass"]
+    official_passed = official_statuses["pass"]
     resource_usage_main = summarize_trial_resource_usage(trials, "main_commands")
     resource_usage_all = summarize_trial_resource_usage(trials, "all_commands")
     resource_usage_overhead = summarize_trial_resource_usage(trials, "overhead_commands")
@@ -1844,7 +2586,15 @@ def build_global_stats(trials: list[dict[str, Any]]) -> dict[str, Any]:
         "trials_errors": statuses["error"],
         "trials_without_reward": statuses["no-reward"],
         "pass_rate": (passed / trial_count) if trial_count else 0.0,
+        "official_trials_passed": official_passed,
+        "official_pass_rate": (official_passed / trial_count) if trial_count else 0.0,
+        "official_status_counts": dict(sorted(official_statuses.items())),
+        "official_status_source": "verifier_result.rewards.reward",
         "reward_mean": numeric_mean(rewards),
+        "agent_cost_usd_sample_count": len(agent_costs),
+        "agent_cost_usd_sum": sum(agent_costs) if agent_costs else None,
+        "agent_cost_usd_avg": numeric_mean(agent_costs),
+        "agent_cost_usd_scope": "agent_result_only",
         "duration_seconds_sum": sum(trial_seconds),
         "duration_seconds_avg": numeric_mean(trial_seconds),
         "duration_seconds_min": min(trial_seconds) if trial_seconds else None,
@@ -1863,6 +2613,7 @@ def build_global_stats(trials: list[dict[str, Any]]) -> dict[str, Any]:
         "resource_usage": resource_usage_main,
         "resource_usage_all_commands": resource_usage_all,
         "resource_usage_overhead_commands": resource_usage_overhead,
+        "artifact_completeness": build_artifact_completeness_summary(trials),
         "status_counts": dict(sorted(statuses.items())),
     }
 
@@ -1880,8 +2631,15 @@ def build_task_rollups(trials: list[dict[str, Any]]) -> list[dict[str, Any]]:
                 "task_name": task_name,
                 "attempts": len(task_trials),
                 "pass_rate": stats["pass_rate"],
+                "official_pass_rate": stats["official_pass_rate"],
                 "status_counts": stats["status_counts"],
+                "official_status_counts": stats["official_status_counts"],
+                "official_status_source": stats["official_status_source"],
                 "reward_mean": stats["reward_mean"],
+                "agent_cost_usd_sample_count": stats["agent_cost_usd_sample_count"],
+                "agent_cost_usd_sum": stats["agent_cost_usd_sum"],
+                "agent_cost_usd_avg": stats["agent_cost_usd_avg"],
+                "agent_cost_usd_scope": stats["agent_cost_usd_scope"],
                 "duration_seconds_avg": stats["duration_seconds_avg"],
                 "duration_seconds_sum": stats["duration_seconds_sum"],
                 "tokens_total": stats["tokens_total"],
@@ -1889,6 +2647,8 @@ def build_task_rollups(trials: list[dict[str, Any]]) -> list[dict[str, Any]]:
                 "activity_total": stats["activity_total"],
                 "activity_avg": stats["activity_avg"],
                 "resource_usage": stats["resource_usage"],
+                "artifact_completeness": stats["artifact_completeness"],
+                "image_parity": build_image_parity_rollup(task_trials),
                 "trial_names": [trial["trial_name"] for trial in task_trials],
             }
         )
@@ -1941,9 +2701,17 @@ def export_run(args: ExportArgs) -> Path:
         if src.exists():
             copy_artifact(src, job_artifacts_dir / src.name)
 
+    job_image_map = load_job_image_map(args.job_dir / "job.log")
     trials = []
     for trial_result in sorted(args.job_dir.glob("*__*/result.json")):
-        trials.append(build_trial_record(trial_result.parent, run_dir, args))
+        trials.append(
+            build_trial_record(
+                trial_result.parent,
+                run_dir,
+                args,
+                job_image_map=job_image_map,
+            )
+        )
 
     task_scope = build_task_scope(args.exact_tasks, args.task_patterns, trials)
     run_artifacts = write_run_jsonl_artifacts(run_dir, trials)
@@ -1987,7 +2755,29 @@ def export_run(args: ExportArgs) -> Path:
                 job_result.get("finished_at"),
             ),
         },
+        "official_scoring": {
+            "score_source": "trial.verifier_result.rewards.reward",
+            "status_source": "trial.verifier_result.rewards.reward",
+            "uses_llm_judgement": False,
+            "auxiliary_analysis_affects_score": False,
+            "harness_error_status_field": "trial.status",
+        },
+        "cost_accounting": {
+            "leaderboard_cost_field": "agent_cost_usd",
+            "legacy_alias": "cost_usd",
+            "source": "trial.agent_result.cost_usd",
+            "scope": "agent_only",
+            "includes_verifier_cost": False,
+            "includes_export_dashboard_analysis_cost": False,
+        },
+        "analysis_accounting": {
+            "auxiliary_analysis_present": False,
+            "official_scoring_uses_auxiliary_analysis": False,
+            "openrouter_allowed_scope": "auxiliary_analysis_only",
+            "auxiliary_analysis_cost_usd": None,
+        },
         "global_stats": build_global_stats(trials),
+        "artifact_completeness": build_artifact_completeness_summary(trials),
         "task_rollups": build_task_rollups(trials),
         "trials": trials,
         "artifacts": run_artifacts,
@@ -2071,6 +2861,12 @@ def load_run_summaries(results_dir: Path) -> list[dict[str, Any]]:
                 "trials_failed": stats.get("trials_failed", 0),
                 "trials_errors": stats.get("trials_errors", 0),
                 "pass_rate": stats.get("pass_rate", 0.0),
+                "official_pass_rate": stats.get("official_pass_rate", stats.get("pass_rate", 0.0)),
+                "official_status_counts": stats.get("official_status_counts") or {},
+                "agent_cost_usd_sample_count": stats.get("agent_cost_usd_sample_count"),
+                "agent_cost_usd_sum": stats.get("agent_cost_usd_sum"),
+                "agent_cost_usd_scope": stats.get("agent_cost_usd_scope"),
+                "artifact_completeness": stats.get("artifact_completeness") or {},
                 "tokens_total": (stats.get("tokens_total") or {}).get("total", 0),
                 "tokens_non_cache_total": (stats.get("tokens_total") or {}).get(
                     "non_cache_total", 0

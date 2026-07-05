@@ -14,24 +14,28 @@ use chrono::Utc;
 use clap::{ArgAction, Parser, ValueEnum};
 use dataset::{LongMemEvalQuestion, load_questions};
 use lash::{
-    LashCore, ModelSpec, PluginStack, SessionSpec, TurnActivity, TurnActivitySink, TurnEvent,
-    TurnInput,
-    persistence::RuntimePersistence,
-    plugins::{PluginSpec, StaticPluginFactory},
+    SessionSpec, TurnInput,
+    advanced::{
+        AssembledTurn, EventSink, ExecutionMode, TurnContext, TurnFinish, TurnOutcome, TurnStop,
+    },
+    plugins::{PluginFactory, PluginSession, PluginSpec, StaticPluginFactory},
     prompt::{PromptSlot, PromptTemplate, PromptTemplateEntry, PromptTemplateSection},
     provider::ProviderHandle,
     usage::{SessionUsageReport, TokenLedgerEntry, TokenUsage, UsageTotals, diff_usage_reports},
 };
-use lash_core::{TestLocalProcessRegistry, TurnFinish, TurnOutcome, TurnStop};
+use lash_core::{
+    BackgroundRuntimeHost, EmbeddedRuntimeHost, InputItem, LashRuntime, LocalBackgroundTaskHost,
+    PersistedSessionState, PersistentRuntimeServices, PluginHost, RuntimeCoreConfig,
+    RuntimePersistence, SessionEvent, SessionPolicy, StandardContextApproach,
+    ToolOutputBudgetPluginFactory, TurnInjectionBridge, TurnInputInjectionBridge,
+};
 use lash_llm_tools::LlmToolsPluginFactory;
+use lash_mode_rlm::RlmTurnInputExt;
 use lash_plugin_observational_memory::ObservationalMemoryPluginFactory;
-use lash_protocol_rlm::RlmTurnInputExt;
+use lash_plugin_rolling_history::RollingHistoryPluginFactory;
 use lash_provider_openai::OPENROUTER_BASE_URL;
 use lash_sqlite_store::Store;
-use lash_standard_plugins::{
-    StandardContextApproach, rolling_history::RollingHistoryPluginFactory,
-};
-use lash_subagents::SubagentsPluginFactory;
+use lash_subagents::{LocalSubagentHost, SubagentHost, SubagentsPluginFactory};
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -49,21 +53,6 @@ const CLEANED_S_URL: &str = "https://huggingface.co/datasets/xiaowu0162/longmeme
 const FLASH_FAILURES_64_URL: &str = "https://raw.githubusercontent.com/rawwerks/longmemeval-rlm/master/data/longmemeval_s_flash_failures_64.json";
 const DISCORDANT_110_URL: &str =
     "https://raw.githubusercontent.com/rawwerks/longmemeval-rlm/master/data/discordant_110.json";
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum ExecutionMode {
-    Standard,
-    Rlm,
-}
-
-impl ExecutionMode {
-    fn as_str(self) -> &'static str {
-        match self {
-            Self::Standard => "standard",
-            Self::Rlm => "rlm",
-        }
-    }
-}
 
 #[derive(Clone, Copy, Debug, ValueEnum)]
 enum PromptProfile {
@@ -603,72 +592,51 @@ async fn run_question(
     let store_path = question_dir.join("session.db");
     let trace_path = question_dir.join("session.trace.jsonl");
     let store = Arc::new(
-        Store::open(&store_path)
-            .await
-            .with_context(|| format!("open {}", store_path.display()))?,
+        Store::open(&store_path).with_context(|| format!("open {}", store_path.display()))?,
     );
-    let model_spec = ModelSpec::from_token_limits(
-        args.model.clone(),
-        args.variant.clone(),
-        args.max_context_tokens,
-        None,
-    )
-    .map_err(anyhow::Error::msg)?;
-    let plugin_stack = build_plugin_stack(
+    let policy = SessionPolicy {
+        model: args.model.clone(),
+        provider: provider.clone(),
+        max_context_tokens: Some(args.max_context_tokens),
+        execution_mode: execution_mode.clone(),
+        standard_context_approach: standard_context_approach.cloned(),
+        model_variant: args.variant.clone(),
+        ..SessionPolicy::default()
+    };
+    let root_plugins = build_plugin_session(
+        execution_mode,
         standard_context_approach.cloned(),
         args.session_tools,
         benchmark_context,
-        &model_spec,
+        &policy,
+    )?;
+    let services = PersistentRuntimeServices::new_with_bridges(
+        root_plugins,
+        TurnInjectionBridge::new(),
+        TurnInputInjectionBridge::new(),
+        store.clone() as Arc<dyn RuntimePersistence>,
     );
-    let session = match execution_mode {
-        ExecutionMode::Standard => {
-            let core = LashCore::standard_builder()
-                .provider(provider.clone())
-                .model(model_spec)
-                .trace_jsonl_path(trace_path.clone())
-                .store_factory(Arc::new(
-                    lash::persistence::InMemorySessionStoreFactory::new(),
-                ))
-                .process_registry(Arc::new(TestLocalProcessRegistry::default()))
-                .process_env_store(Arc::new(
-                    lash::persistence::InMemoryProcessExecutionEnvStore::new(),
-                ))
-                .effect_host(Arc::new(lash::durability::InlineEffectHost::default()))
-                .attachment_store(Arc::new(lash::persistence::InMemoryAttachmentStore::new()))
-                .plugins(plugin_stack)
-                .build()?;
-            core.session("root")
-                .store(store.clone() as Arc<dyn RuntimePersistence>)
-                .open()
-                .await?
-        }
-        ExecutionMode::Rlm => {
-            let core = LashCore::rlm_builder(lash::rlm::RlmProtocolPluginFactory::new(
-                lash::rlm::RlmProtocolPluginConfig::default(),
-                Arc::new(lash::persistence::InMemoryLashlangArtifactStore::new()),
-            ))
-            .provider(provider.clone())
-            .model(model_spec)
-            .trace_jsonl_path(trace_path.clone())
-            .store_factory(Arc::new(
-                lash::persistence::InMemorySessionStoreFactory::new(),
-            ))
-            .process_registry(Arc::new(TestLocalProcessRegistry::default()))
-            .process_env_store(Arc::new(
-                lash::persistence::InMemoryProcessExecutionEnvStore::new(),
-            ))
-            .effect_host(Arc::new(lash::durability::InlineEffectHost::default()))
-            .attachment_store(Arc::new(lash::persistence::InMemoryAttachmentStore::new()))
-            .plugins(plugin_stack)
-            .build()?;
-            core.session("root")
-                .store(store.clone() as Arc<dyn RuntimePersistence>)
-                .open()
-                .await?
-        }
-    };
+    let host = BackgroundRuntimeHost::new(
+        EmbeddedRuntimeHost::new(
+            RuntimeCoreConfig::default()
+                .with_trace_jsonl_path(Some(trace_path.clone()))
+                .with_prompt_template(prompt_template(args.prompt_profile, args.session_tools)),
+        ),
+        Arc::new(LocalBackgroundTaskHost::default()),
+    );
+    let mut runtime = LashRuntime::from_persistent_background_state(
+        policy.clone(),
+        host,
+        services,
+        PersistedSessionState {
+            session_id: "root".to_string(),
+            policy,
+            ..PersistedSessionState::default()
+        },
+    )
+    .await?;
 
-    let before_usage = session.usage_report();
+    let before_usage = runtime.usage_report();
     let cancel = tokio_util::sync::CancellationToken::new();
     let sink = JsonlEventSink::new(
         question_dir.join("events.jsonl"),
@@ -676,18 +644,27 @@ async fn run_question(
         cancel.clone(),
     )?;
     let started_at = std::time::Instant::now();
-    let turn = session
-        .turn(TurnInput::text(prompt).rlm_project(build_projected_bindings(&question)?)?)
-        .cancel(cancel)
-        .prompt_template(prompt_template(args.prompt_profile, args.session_tools))
-        .stream_to(&sink)
+    let turn = runtime
+        .stream_turn(
+            (TurnInput {
+                items: vec![InputItem::Text { text: prompt }],
+                image_blobs: Default::default(),
+                mode_turn_options: None,
+                trace_turn_id: None,
+                mode_extension: None,
+                turn_context: TurnContext::default(),
+            })
+            .rlm_project(build_projected_bindings(&question)?)?,
+            &sink,
+            cancel,
+        )
         .await
         .context("run benchmark question")?;
     if args.await_background_work {
-        session.processes().await_all().await?;
+        runtime.await_background_work().await?;
     }
     let elapsed_seconds = started_at.elapsed().as_secs_f64();
-    let after_usage = session.usage_report();
+    let after_usage = runtime.usage_report();
     let usage = diff_usage_reports(&before_usage, &after_usage)
         .map(|rows| SessionUsageReport::from_entries(&rows))
         .map_err(anyhow::Error::msg)
@@ -764,45 +741,52 @@ async fn run_question(
     Ok(result)
 }
 
-fn build_plugin_stack(
+fn build_plugin_session(
+    execution_mode: ExecutionMode,
     standard_context_approach: Option<StandardContextApproach>,
     session_tools: bool,
     benchmark_context: BenchmarkQuestionContext,
-    model: &ModelSpec,
-) -> PluginStack {
-    let mut stack = lash::plugins::runtime_plugin_stack();
+    session_policy: &SessionPolicy,
+) -> anyhow::Result<Arc<PluginSession>> {
+    let mut factories: Vec<Arc<dyn PluginFactory>> =
+        vec![Arc::new(ToolOutputBudgetPluginFactory::default())];
     if let Some(standard_context_approach) = &standard_context_approach {
         match standard_context_approach {
             StandardContextApproach::RollingHistory(_) => {
-                stack.push(Arc::new(RollingHistoryPluginFactory::default()));
+                factories.push(Arc::new(RollingHistoryPluginFactory::default()));
             }
             StandardContextApproach::ObservationalMemory(_) => {
-                stack.push(Arc::new(ObservationalMemoryPluginFactory::default()));
+                factories.push(Arc::new(ObservationalMemoryPluginFactory));
             }
         }
     }
     let mut subagent_models = std::collections::BTreeMap::new();
-    subagent_models.insert("explore".to_string(), model.clone());
-    subagent_models.insert("peer".to_string(), model.clone());
+    subagent_models.insert("explore".to_string(), session_policy.model.clone());
+    subagent_models.insert("peer".to_string(), session_policy.model.clone());
     let registry = std::sync::Arc::new(lash_subagents::default_registry(&subagent_models));
-    stack.push(Arc::new(LlmToolsPluginFactory::default()));
-    stack.push(Arc::new(
-        SubagentsPluginFactory::new(registry).with_session_spec(SessionSpec::inherit()),
+    let subagent_host: Arc<dyn SubagentHost> = Arc::new(LocalSubagentHost::default());
+    factories.push(Arc::new(LlmToolsPluginFactory::default()));
+    factories.push(Arc::new(
+        SubagentsPluginFactory::new(registry, subagent_host)
+            .with_session_spec(SessionSpec::inherit()),
     ));
     if session_tools {
-        stack.push(Arc::new(StaticPluginFactory::new(
+        factories.push(Arc::new(StaticPluginFactory::new(
             "longmemeval_tools",
             PluginSpec::new()
-                .with_tool_provider(LongMemEvalSessionTools::into_provider(benchmark_context)),
+                .with_tool_provider(Arc::new(LongMemEvalSessionTools::new(benchmark_context))),
         )));
     }
-    stack
+    let plugin_host = PluginHost::new(factories);
+    plugin_host
+        .build_session("root", execution_mode, standard_context_approach, None)
+        .context("build plugin session")
 }
 
 fn build_projected_bindings(
     question: &LongMemEvalQuestion,
-) -> anyhow::Result<lash_protocol_rlm::RlmProjectedBindings> {
-    Ok(lash_protocol_rlm::RlmProjectedBindings::new()
+) -> anyhow::Result<lash_mode_rlm::RlmProjectedBindings> {
+    Ok(lash_mode_rlm::RlmProjectedBindings::new()
         .bind_json(
             "benchmark",
             json!({
@@ -898,7 +882,7 @@ Format each work step like this:
 Brief reasoning here in plain prose.
 
 ```lashlang
-candidate = start call spawn_agent { task: "narrow the search to likely sessions", capability: "explore" }
+candidate = start call spawn_agent { agent_name: "narrow_candidates", task: "narrow the search to likely sessions", capability: "explore" }
 result = (await candidate)?
 print result
 ```
@@ -995,8 +979,8 @@ fn read_env_var(name: &str) -> Option<String> {
 
 fn parse_execution_mode(raw: &str) -> anyhow::Result<ExecutionMode> {
     match raw {
-        "rlm" => Ok(ExecutionMode::Rlm),
-        "standard" => Ok(ExecutionMode::Standard),
+        "rlm" => Ok(ExecutionMode::new("rlm")),
+        "standard" => Ok(ExecutionMode::standard()),
         _ => bail!("unsupported execution mode `{raw}`"),
     }
 }
@@ -1015,7 +999,7 @@ fn resolve_standard_context_approach(
     execution_mode: &ExecutionMode,
     raw: Option<&str>,
 ) -> anyhow::Result<Option<StandardContextApproach>> {
-    if *execution_mode == ExecutionMode::Standard {
+    if *execution_mode == ExecutionMode::standard() {
         return parse_standard_context_approach(raw.unwrap_or(DEFAULT_CONTEXT_APPROACH)).map(Some);
     }
     if raw.is_some() {
@@ -1025,7 +1009,7 @@ fn resolve_standard_context_approach(
 }
 
 fn execution_mode_label(mode: &ExecutionMode) -> &str {
-    mode.as_str()
+    mode.plugin_id()
 }
 
 fn standard_context_approach_label(approach: &StandardContextApproach) -> &'static str {
@@ -1074,8 +1058,8 @@ fn aggregate_usage(reports: impl IntoIterator<Item = SessionUsageReport>) -> Ses
             let entry = total.entry(key).or_default();
             entry.input_tokens += row.usage.input_tokens;
             entry.output_tokens += row.usage.output_tokens;
-            entry.cache_read_input_tokens += row.usage.cache_read_input_tokens;
-            entry.reasoning_output_tokens += row.usage.reasoning_output_tokens;
+            entry.cached_input_tokens += row.usage.cached_input_tokens;
+            entry.reasoning_tokens += row.usage.reasoning_tokens;
         }
     }
     let entries = total
@@ -1155,9 +1139,9 @@ fn format_usage_line(label: &str, usage: &UsageTotals) -> String {
     format!(
         "{label}: input={} cached={} output={} reasoning={} total={} context_total={}",
         usage.input_tokens,
-        usage.cache_read_input_tokens,
+        usage.cached_input_tokens,
         usage.output_tokens,
-        usage.reasoning_output_tokens,
+        usage.reasoning_tokens,
         usage.total_tokens,
         usage.context_total_tokens
     )
@@ -1351,45 +1335,44 @@ impl JsonlEventSink {
 }
 
 #[async_trait::async_trait]
-impl TurnActivitySink for JsonlEventSink {
-    async fn emit(&self, activity: TurnActivity) {
-        if let TurnEvent::ModelRequestStarted { protocol_iteration } = &activity.event {
+impl EventSink for JsonlEventSink {
+    async fn emit(&self, event: SessionEvent) {
+        if let SessionEvent::LlmRequest { mode_iteration, .. } = &event {
             if let Ok(mut count) = self.llm_call_count.lock() {
                 *count += 1;
             }
             if let Ok(mut iterations) = self.llm_iterations.lock() {
-                iterations.insert(*protocol_iteration);
+                iterations.insert(*mode_iteration);
             }
         }
-        if let TurnEvent::AssistantProseDelta { text } = &activity.event {
-            if let Ok(mut last) = self.last_llm_response.lock() {
-                let buffer = last.get_or_insert_with(String::new);
-                buffer.push_str(text);
-            }
+        if let SessionEvent::LlmResponse { content, .. } = &event
+            && let Ok(mut last) = self.last_llm_response.lock()
+        {
+            *last = Some(content.trim().to_string());
         }
-        if matches!(activity.event, TurnEvent::RetryStatus { .. })
+        if matches!(event, SessionEvent::RetryStatus { .. })
             && let Ok(mut count) = self.retry_count.lock()
         {
             *count += 1;
         }
-        if let TurnEvent::Error { message } = &activity.event
+        if let SessionEvent::Error { message, envelope } = &event
             && let Ok(mut errors) = self.error_records.lock()
         {
             errors.push(SinkErrorRecord {
                 message: message.clone(),
-                kind: None,
-                code: None,
-                raw: None,
+                kind: envelope.as_ref().map(|value| value.kind.clone()),
+                code: envelope.as_ref().and_then(|value| value.code.clone()),
+                raw: envelope.as_ref().and_then(|value| value.raw.clone()),
             });
         }
-        if let TurnEvent::Usage { usage, .. } | TurnEvent::ChildUsage { usage, .. } =
-            &activity.event
+        if let SessionEvent::TokenUsage { usage, .. } | SessionEvent::ChildTokenUsage { usage, .. } =
+            &event
             && let Ok(mut budget) = self.token_budget.lock()
             && budget.record(usage)
         {
             self.cancel.cancel();
         }
-        if let Ok(line) = serde_json::to_string(&activity)
+        if let Ok(line) = serde_json::to_string(&event)
             && let Ok(mut file) = self.file.lock()
         {
             let _ = writeln!(file, "{line}");
@@ -1400,13 +1383,13 @@ impl TurnActivitySink for JsonlEventSink {
 fn turn_completed(outcome: &TurnOutcome) -> bool {
     matches!(
         outcome,
-        TurnOutcome::Finished(_) | TurnOutcome::AgentFrameSwitch { .. }
+        TurnOutcome::Finished(_) | TurnOutcome::Handoff { .. }
     )
 }
 
 fn turn_status_label(outcome: &TurnOutcome) -> &'static str {
     match outcome {
-        TurnOutcome::Finished(_) | TurnOutcome::AgentFrameSwitch { .. } => "completed",
+        TurnOutcome::Finished(_) | TurnOutcome::Handoff { .. } => "completed",
         TurnOutcome::Stopped(TurnStop::Cancelled) => "interrupted",
         TurnOutcome::Stopped(_) => "failed",
     }
@@ -1415,9 +1398,9 @@ fn turn_status_label(outcome: &TurnOutcome) -> &'static str {
 fn done_reason_label(outcome: &TurnOutcome) -> &'static str {
     match outcome {
         TurnOutcome::Finished(TurnFinish::AssistantMessage { .. }) => "assistant_message",
-        TurnOutcome::Finished(TurnFinish::FinalValue { .. }) => "submitted_value",
+        TurnOutcome::Finished(TurnFinish::SubmittedValue { .. }) => "submitted_value",
         TurnOutcome::Finished(TurnFinish::ToolValue { .. }) => "tool_value",
-        TurnOutcome::AgentFrameSwitch { .. } => "agent_frame_switch",
+        TurnOutcome::Handoff { .. } => "handoff",
         TurnOutcome::Stopped(TurnStop::Cancelled) => "cancelled",
         TurnOutcome::Stopped(TurnStop::Incomplete) => "incomplete",
         TurnOutcome::Stopped(TurnStop::InvalidInput) => "invalid_input",
@@ -1436,8 +1419,8 @@ fn context_tokens_for_usage(usage: &TokenUsage) -> i64 {
         .input_tokens
         .max(0)
         .saturating_add(usage.output_tokens.max(0))
-        .saturating_add(usage.reasoning_output_tokens.max(0))
-        .saturating_add(usage.cache_read_input_tokens.max(0))
+        .saturating_add(usage.reasoning_tokens.max(0))
+        .saturating_add(usage.cached_input_tokens.max(0))
 }
 
 fn non_empty_text(text: &str) -> Option<String> {
@@ -1450,7 +1433,7 @@ fn non_empty_text(text: &str) -> Option<String> {
 }
 
 fn format_failure_reason(
-    turn: &lash::TurnResult,
+    turn: &AssembledTurn,
     error_records: &[SinkErrorRecord],
 ) -> Option<String> {
     if turn_completed(&turn.outcome) {
@@ -1491,9 +1474,8 @@ mod tests {
         assert!(!budget.record(&TokenUsage {
             input_tokens: 40,
             output_tokens: 5,
-            cache_read_input_tokens: 10,
-            cache_write_input_tokens: 0,
-            reasoning_output_tokens: 0,
+            cached_input_tokens: 10,
+            reasoning_tokens: 0,
         }));
         assert_eq!(budget.observed_context_tokens, 55);
         assert!(!budget.exceeded);
@@ -1505,16 +1487,14 @@ mod tests {
         assert!(!budget.record(&TokenUsage {
             input_tokens: 45,
             output_tokens: 5,
-            cache_read_input_tokens: 0,
-            cache_write_input_tokens: 0,
-            reasoning_output_tokens: 0,
+            cached_input_tokens: 0,
+            reasoning_tokens: 0,
         }));
         assert!(budget.record(&TokenUsage {
             input_tokens: 40,
             output_tokens: 0,
-            cache_read_input_tokens: 20,
-            cache_write_input_tokens: 0,
-            reasoning_output_tokens: 0,
+            cached_input_tokens: 20,
+            reasoning_tokens: 0,
         }));
         assert_eq!(budget.observed_context_tokens, 110);
         assert!(budget.exceeded);

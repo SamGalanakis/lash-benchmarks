@@ -12,10 +12,9 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result, anyhow, bail};
 use lash_core::{ProviderFactory, ProviderHandle, ProviderSpec};
 use lash_provider_anthropic::AnthropicProviderFactory;
+use lash_provider_codex::CodexProviderFactory;
 use lash_provider_google::GoogleOAuthProviderFactory;
-use lash_provider_openai::{
-    CodexProviderFactory, OpenAiCompatibleProviderFactory, OpenAiProviderFactory,
-};
+use lash_provider_openai::{OpenAiCompatibleProviderFactory, OpenAiProviderFactory};
 use serde::Deserialize;
 
 /// The slice of `~/.lash/config.json` the benchmarks read: the active provider

@@ -127,8 +127,12 @@ def load_codex_metadata(codex_path: Path | None) -> dict[str, Any]:
             usage = record.get("usage") or {}
             tokens["input"] += int(usage.get("input_tokens") or 0)
             tokens["output"] += int(usage.get("output_tokens") or 0)
-            tokens["reasoning"] += int(usage.get("reasoning_output_tokens") or 0)
-            cached = int(usage.get("cache_read_input_tokens") or 0)
+            tokens["reasoning"] += int(
+                usage.get("reasoning_tokens") or usage.get("reasoning_output_tokens") or 0
+            )
+            cached = int(
+                usage.get("cached_input_tokens") or usage.get("cache_read_input_tokens") or 0
+            )
             tokens["cache"] += cached
             tokens["cache_read"] += cached
             total = tokens["input"] + tokens["output"]

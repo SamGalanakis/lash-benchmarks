@@ -17,10 +17,10 @@ lash-cli = { workspace = true }
 lash-export = { workspace = true }
 lash-sqlite-store = { workspace = true }
 lash-llm-tools = { workspace = true }
-lash-protocol-rlm = { workspace = true }
+lash-mode-rlm = { workspace = true }
 lash-rlm-types = { workspace = true }
-lash-plugin-process-controls = { workspace = true }
 lash-provider-openai = { workspace = true }
+lash-providers-builtin = { workspace = true }
 lash-subagents = { workspace = true }
 tokio = { workspace = true, features = ["full"] }
 tokio-util = { workspace = true, features = ["rt"] }
