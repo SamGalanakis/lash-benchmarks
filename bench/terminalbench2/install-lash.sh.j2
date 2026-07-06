@@ -1,15 +1,86 @@
 #!/bin/bash
 set -euo pipefail
 
-# Install Python 3 runtime needed by lash's embedded RLM setup.
-if command -v apk >/dev/null 2>&1; then
-  apk add --no-cache python3 py3-pip bash curl
-elif command -v apt-get >/dev/null 2>&1; then
-  apt-get update
-  apt-get install -y python3 python3-pip bash curl
-else
+# Install only what the lash binary needs to run in the trial container.
+# Task-specific tooling (e.g. python3) belongs in the task image or is agent work.
+readonly LASH_AGENT_PACKAGES=(bash curl ca-certificates)
+readonly APT_MAX_RETRIES=3
+
+is_package_installed() {
+  local pkg="$1"
+
+  if command -v apk >/dev/null 2>&1; then
+    apk info -e "${pkg}" >/dev/null 2>&1
+    return
+  fi
+
+  if command -v apt-get >/dev/null 2>&1; then
+    dpkg -s "${pkg}" >/dev/null 2>&1
+    return
+  fi
+
   echo "Unsupported distribution (need apk or apt-get)" >&2
-  exit 1
+  return 1
+}
+
+collect_missing_agent_packages() {
+  local pkg
+  local -n missing_packages_ref="$1"
+
+  missing_packages_ref=()
+  for pkg in "${LASH_AGENT_PACKAGES[@]}"; do
+    if ! is_package_installed "${pkg}"; then
+      missing_packages_ref+=("${pkg}")
+    fi
+  done
+}
+
+apt_install_with_retry() {
+  local attempt
+  for attempt in $(seq 1 "${APT_MAX_RETRIES}"); do
+    if apt-get "${@}"; then
+      return 0
+    fi
+    if [[ "${attempt}" -eq "${APT_MAX_RETRIES}" ]]; then
+      return 1
+    fi
+    echo "apt-get failed (attempt ${attempt}/${APT_MAX_RETRIES}); retrying..." >&2
+    sleep $((attempt * 2))
+  done
+}
+
+agent_packages_missing() {
+  local missing=()
+  collect_missing_agent_packages missing
+  ((${#missing[@]} > 0))
+}
+
+install_lash_agent_packages() {
+  local missing=()
+  collect_missing_agent_packages missing
+  if ((${#missing[@]} == 0)); then
+    return 0
+  fi
+
+  if command -v apk >/dev/null 2>&1; then
+    apk add --no-cache "${missing[@]}"
+    return 0
+  fi
+
+  if command -v apt-get >/dev/null 2>&1; then
+    export DEBIAN_FRONTEND=noninteractive
+    apt_install_with_retry update -o Acquire::Retries=3
+    apt_install_with_retry install -y --no-install-recommends "${missing[@]}"
+    rm -rf /var/lib/apt/lists/*
+    return 0
+  fi
+
+  echo "Unsupported distribution (need apk or apt-get)" >&2
+  return 1
+}
+
+if agent_packages_missing; then
+  install_lash_agent_packages
 fi
 
 chmod +x /installed-agent/lash
