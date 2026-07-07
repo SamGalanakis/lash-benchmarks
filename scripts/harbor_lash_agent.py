@@ -297,16 +297,21 @@ class LashAgent(BaseInstalledAgent):
         prompt = shlex.quote(augmented_instruction)
 
         lash_binary = "/installed-agent/lash"
+        lash_cmd = (
+            f"{lash_binary} {model_flag}{variant_flag}"
+            f"{context_approach_flag}{execution_mode_flag}"
+            f"{trace_flags}{turn_usage_flag}"
+            f"--print {prompt}"
+        )
 
         return [
             ExecInput(
                 command=(
                     f"mkdir -p /logs/agent/command-0 && "
                     f"chmod +x {shlex.quote(lash_binary)} && "
-                    f"{shlex.quote(lash_binary)} {model_flag}{variant_flag}"
-                    f"{context_approach_flag}{execution_mode_flag}"
-                    f"{trace_flags}{turn_usage_flag}"
-                    f"--print {prompt}"
+                    # Harbor runs via docker compose exec without a TTY; lash --print
+                    # calls enable_raw_mode() and fails with ENXIO otherwise.
+                    f"script -q -c {shlex.quote(lash_cmd)} /dev/null"
                 ),
                 env=env,
                 timeout_sec=None,
