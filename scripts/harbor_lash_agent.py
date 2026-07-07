@@ -64,6 +64,29 @@ state. For these tasks:
 - For recovery or forensics tasks, copy the original evidence to `/tmp`
   before opening it with tools that may mutate, checkpoint, normalize, or
   delete sidecar files.
+
+## Task hints are hard constraints
+
+- When the task names exact identifiers (CWE IDs, filenames, ports, output
+  formats, column names), match them exactly. Do not substitute a related but
+  different value.
+- Re-read the task hint block immediately before writing report or output files.
+
+## Verification before submit
+
+- Do not call `submit` until task-specific verification passes.
+- If a verification command fails, fix the issue and re-verify in a subsequent
+  lashlang block. Do not submit a failure summary as your final answer.
+- If `/tests/test_outputs.py` exists at the container root (often outside the
+  task repo under `/tests/`), run it in addition to any repo-local tests — it
+  is frequently the actual grade.
+
+## Patch and command style
+
+- Prefer small `apply_patch` edits and short verification commands over large
+  heredoc scripts that rewrite many files at once.
+- After `apply_patch` succeeds, run a targeted import, syntax, or behaviour
+  check before broad test suites.
 """
 
 INSTALL_GNU_TIME_COMMAND = """
