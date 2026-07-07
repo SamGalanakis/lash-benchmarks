@@ -14,13 +14,13 @@ bench-common = { workspace = true }
 lash = { workspace = true }
 lash-core = { workspace = true }
 lash-mode-rlm = { workspace = true }
+lash-mode-standard = { workspace = true }
 lash-sqlite-store = { workspace = true }
 lash-llm-tools = { workspace = true }
 lash-plugin-observational-memory = { workspace = true }
-lash-plugin-rolling-history = { workspace = true }
+lash-lashlang-runtime = { workspace = true }
 lash-standard-plugins = { workspace = true }
 lash-provider-openai = { workspace = true }
-lash-providers-builtin = { workspace = true }
 lash-subagents = { workspace = true }
 tokio = { workspace = true, features = ["full"] }
 tokio-util = { workspace = true, features = ["rt"] }

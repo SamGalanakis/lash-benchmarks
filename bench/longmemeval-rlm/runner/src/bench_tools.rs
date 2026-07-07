@@ -1,8 +1,7 @@
 use std::sync::Arc;
 
 use lash::tools::{
-    ToolAvailabilityConfig, ToolCall, ToolContract, ToolDefinition, ToolExecutionMode,
-    ToolManifest, ToolProvider, ToolResult,
+    ToolCall, ToolContract, ToolDefinition, ToolManifest, ToolProvider, ToolResult, ToolScheduling,
 };
 use regex::RegexBuilder;
 use serde_json::json;
@@ -199,13 +198,13 @@ impl LongMemEvalSessionTools {
 
 fn bench_tool(name: &str, description: &str, input_schema: serde_json::Value) -> ToolDefinition {
     ToolDefinition::raw(
+        format!("tool:{name}"),
         name,
         description,
         input_schema,
         serde_json::json!({ "type": "object", "additionalProperties": true }),
     )
-    .with_availability(ToolAvailabilityConfig::callable())
-    .with_execution_mode(ToolExecutionMode::Parallel)
+    .with_scheduling(ToolScheduling::Parallel)
 }
 
 #[async_trait::async_trait]
@@ -220,7 +219,7 @@ impl ToolProvider for LongMemEvalSessionTools {
     fn resolve_contract(&self, name: &str) -> Option<Arc<ToolContract>> {
         self.tool_definitions()
             .into_iter()
-            .find(|tool| tool.name == name)
+            .find(|tool| tool.name() == name)
             .map(|tool| Arc::new(tool.contract()))
     }
 

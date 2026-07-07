@@ -271,7 +271,7 @@ class LashSystem(ContinualLearningSystem):
             return action, metadata
 
         raise RuntimeError(
-            "Lash submitted a value that passed through the runner but could not "
+            "Lash finished with a value that passed through the runner but could not "
             "be instantiated as the CLBench response model"
         ) from last_error
 

@@ -4,7 +4,7 @@ External benchmark harnesses for Lash.
 
 The Rust runners (`bench/*/runner`) depend on Lash from the latest GitHub
 release tag pinned in the workspace `Cargo.toml` (the facade crate is
-`lash`). The current pin is `v0.2.131`.
+`lash`). The current pin is `v0.1.0-alpha.85`.
 
 The `lash` CLI binary that drives Terminal Bench is **not** published to
 crates.io (the `lash-cli` crate is `publish = false`), so the Terminal Bench

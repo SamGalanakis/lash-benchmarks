@@ -14,28 +14,32 @@ use chrono::Utc;
 use clap::{ArgAction, Parser, ValueEnum};
 use dataset::{LongMemEvalQuestion, load_questions};
 use lash::{
-    SessionSpec, TurnInput,
-    advanced::{
-        AssembledTurn, EventSink, ExecutionMode, TurnContext, TurnFinish, TurnOutcome, TurnStop,
+    ModelSpec, SessionSpec, TurnFinish, TurnInput, TurnOutcome, TurnStop,
+    plugins::{
+        PluginFactory, PluginSession, PluginSpec, StaticPluginFactory,
+        ToolOutputBudgetPluginFactory,
     },
-    plugins::{PluginFactory, PluginSession, PluginSpec, StaticPluginFactory},
     prompt::{PromptSlot, PromptTemplate, PromptTemplateEntry, PromptTemplateSection},
     provider::ProviderHandle,
+    runtime::{
+        AssembledTurn, EventSink, ExecutionScope, InlineRuntimeEffectController, LashRuntime,
+        TurnContext,
+    },
     usage::{SessionUsageReport, TokenLedgerEntry, TokenUsage, UsageTotals, diff_usage_reports},
 };
 use lash_core::{
-    BackgroundRuntimeHost, EmbeddedRuntimeHost, InputItem, LashRuntime, LocalBackgroundTaskHost,
-    PersistedSessionState, PersistentRuntimeServices, PluginHost, RuntimeCoreConfig,
-    RuntimePersistence, SessionEvent, SessionPolicy, StandardContextApproach,
-    ToolOutputBudgetPluginFactory, TurnInjectionBridge, TurnInputInjectionBridge,
+    InputItem, PluginHost, RuntimePersistence, SessionEvent, SessionPolicy, SingleProviderResolver,
+    TurnOptions,
 };
 use lash_llm_tools::LlmToolsPluginFactory;
-use lash_mode_rlm::RlmTurnInputExt;
+use lash_mode_rlm::{RlmProtocolPluginConfig, RlmProtocolPluginFactory, RlmTurnInputExt};
 use lash_plugin_observational_memory::ObservationalMemoryPluginFactory;
-use lash_plugin_rolling_history::RollingHistoryPluginFactory;
 use lash_provider_openai::OPENROUTER_BASE_URL;
 use lash_sqlite_store::Store;
-use lash_subagents::{LocalSubagentHost, SubagentHost, SubagentsPluginFactory};
+use lash_standard_plugins::{
+    StandardContextApproach, rolling_history::RollingHistoryPluginFactory,
+};
+use lash_subagents::SubagentsPluginFactory;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -68,6 +72,21 @@ enum DatasetPreset {
     FlashFailures64,
     #[value(name = "discordant-110")]
     Discordant110,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ExecutionMode {
+    Standard,
+    Rlm,
+}
+
+impl ExecutionMode {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Standard => "standard",
+            Self::Rlm => "rlm",
+        }
+    }
 }
 
 impl DatasetPreset {
@@ -592,15 +611,21 @@ async fn run_question(
     let store_path = question_dir.join("session.db");
     let trace_path = question_dir.join("session.trace.jsonl");
     let store = Arc::new(
-        Store::open(&store_path).with_context(|| format!("open {}", store_path.display()))?,
+        Store::open(&store_path)
+            .await
+            .with_context(|| format!("open {}", store_path.display()))?,
     );
+    let model_spec = ModelSpec::from_token_limits(
+        args.model.clone(),
+        args.variant.clone(),
+        args.max_context_tokens,
+        None,
+    )
+    .map_err(anyhow::Error::msg)?;
     let policy = SessionPolicy {
-        model: args.model.clone(),
-        provider: provider.clone(),
-        max_context_tokens: Some(args.max_context_tokens),
-        execution_mode: execution_mode.clone(),
-        standard_context_approach: standard_context_approach.cloned(),
-        model_variant: args.variant.clone(),
+        model: model_spec,
+        provider_id: provider.kind().to_string(),
+        session_id: Some("root".to_string()),
         ..SessionPolicy::default()
     };
     let root_plugins = build_plugin_session(
@@ -610,31 +635,18 @@ async fn run_question(
         benchmark_context,
         &policy,
     )?;
-    let services = PersistentRuntimeServices::new_with_bridges(
-        root_plugins,
-        TurnInjectionBridge::new(),
-        TurnInputInjectionBridge::new(),
-        store.clone() as Arc<dyn RuntimePersistence>,
-    );
-    let host = BackgroundRuntimeHost::new(
-        EmbeddedRuntimeHost::new(
-            RuntimeCoreConfig::default()
-                .with_trace_jsonl_path(Some(trace_path.clone()))
-                .with_prompt_template(prompt_template(args.prompt_profile, args.session_tools)),
-        ),
-        Arc::new(LocalBackgroundTaskHost::default()),
-    );
-    let mut runtime = LashRuntime::from_persistent_background_state(
-        policy.clone(),
-        host,
-        services,
-        PersistedSessionState {
-            session_id: "root".to_string(),
-            policy,
-            ..PersistedSessionState::default()
-        },
-    )
-    .await?;
+    let mut runtime = LashRuntime::builder()
+        .with_session_id("root")
+        .with_policy(policy)
+        .with_plugin_session(root_plugins)
+        .with_store(store.clone() as Arc<dyn RuntimePersistence>)
+        .with_provider_resolver(Arc::new(SingleProviderResolver::new(provider.clone())))
+        .with_trace_sink(Some(Arc::new(lash::tracing::JsonlTraceSink::new(
+            trace_path.clone(),
+        ))))
+        .with_prompt_template(prompt_template(args.prompt_profile, args.session_tools))
+        .build()
+        .await?;
 
     let before_usage = runtime.usage_report();
     let cancel = tokio_util::sync::CancellationToken::new();
@@ -644,19 +656,27 @@ async fn run_question(
         cancel.clone(),
     )?;
     let started_at = std::time::Instant::now();
+    let turn_id = "question-turn";
+    let turn_input = (TurnInput {
+        items: vec![InputItem::Text { text: prompt }],
+        image_blobs: Default::default(),
+        protocol_turn_options: None,
+        trace_turn_id: Some(turn_id.to_string()),
+        protocol_extension: None,
+        turn_context: TurnContext::default(),
+    })
+    .rlm_project(build_projected_bindings(&question)?)?;
     let turn = runtime
         .stream_turn(
-            (TurnInput {
-                items: vec![InputItem::Text { text: prompt }],
-                image_blobs: Default::default(),
-                mode_turn_options: None,
-                trace_turn_id: None,
-                mode_extension: None,
-                turn_context: TurnContext::default(),
-            })
-            .rlm_project(build_projected_bindings(&question)?)?,
-            &sink,
-            cancel,
+            turn_input,
+            TurnOptions::new(
+                cancel,
+                lash_core::ScopedEffectController::shared(
+                    Arc::new(InlineRuntimeEffectController),
+                    ExecutionScope::turn("root", turn_id),
+                )?,
+            )
+            .with_events(&sink),
         )
         .await
         .context("run benchmark question")?;
@@ -756,7 +776,7 @@ fn build_plugin_session(
                 factories.push(Arc::new(RollingHistoryPluginFactory::default()));
             }
             StandardContextApproach::ObservationalMemory(_) => {
-                factories.push(Arc::new(ObservationalMemoryPluginFactory));
+                factories.push(Arc::new(ObservationalMemoryPluginFactory::default()));
             }
         }
     }
@@ -764,11 +784,9 @@ fn build_plugin_session(
     subagent_models.insert("explore".to_string(), session_policy.model.clone());
     subagent_models.insert("peer".to_string(), session_policy.model.clone());
     let registry = std::sync::Arc::new(lash_subagents::default_registry(&subagent_models));
-    let subagent_host: Arc<dyn SubagentHost> = Arc::new(LocalSubagentHost::default());
     factories.push(Arc::new(LlmToolsPluginFactory::default()));
     factories.push(Arc::new(
-        SubagentsPluginFactory::new(registry, subagent_host)
-            .with_session_spec(SessionSpec::inherit()),
+        SubagentsPluginFactory::new(registry).with_session_spec(SessionSpec::inherit()),
     ));
     if session_tools {
         factories.push(Arc::new(StaticPluginFactory::new(
@@ -777,9 +795,22 @@ fn build_plugin_session(
                 .with_tool_provider(Arc::new(LongMemEvalSessionTools::new(benchmark_context))),
         )));
     }
+    if execution_mode == ExecutionMode::Standard {
+        factories.push(Arc::new(
+            lash_mode_standard::StandardProtocolPluginFactory::new(),
+        ));
+    } else {
+        factories.push(Arc::new(
+            RlmProtocolPluginFactory::new(
+                RlmProtocolPluginConfig::default(),
+                Arc::new(lash_lashlang_runtime::InMemoryLashlangArtifactStore::new()),
+            )
+            .with_process_lifecycle(false),
+        ));
+    }
     let plugin_host = PluginHost::new(factories);
     plugin_host
-        .build_session("root", execution_mode, standard_context_approach, None)
+        .build_session("root", None)
         .context("build plugin session")
 }
 
@@ -821,7 +852,7 @@ fn build_prompt(
         }
     };
     let mut prompt = format!(
-        "Question: {user_question}\nAsked on: {question_date}\nType: {question_type}\n\nRequirements:\n- prefer the most recent relevant fact\n- verify dates and entities before answering\n- if the history does not support an answer, say \"I don't know\"\n- the submitted final response must be plain prose",
+        "Question: {user_question}\nAsked on: {question_date}\nType: {question_type}\n\nRequirements:\n- prefer the most recent relevant fact\n- verify dates and entities before answering\n- if the history does not support an answer, say \"I don't know\"\n- the final response must be plain prose",
         question_date = question
             .question
             .question_date
@@ -863,15 +894,15 @@ print result
 
 - Wrap each work step in exactly one ` ```lashlang ` fenced block. Only the first block runs per turn.
 - Keep prose short. It is only a compact reasoning trace.
-- After each result, either write another fenced block to continue or call `submit <value>` from inside a fenced `lashlang` block to end the turn.
-- When you are done, call `submit <value>` from inside a fenced `lashlang` block. Do not end in prose without a fenced block.
+- After each result, either write another fenced block to continue or call `finish <value>` from inside a fenced `lashlang` block to end the turn.
+- When you are done, call `finish <value>` from inside a fenced `lashlang` block. Do not end in prose without a fenced block.
 - Variables persist across iterations.
 - You can update variable-rooted collection paths: `record.field = value`, `record[key] = value`, `list[i] = value`, and nested forms. Record assignment inserts/replaces fields; list assignment replaces an existing integer index only. Dynamic record reads return `null` when missing, so `counts[g] = counts[g] + 1` works for histograms.
 - If the prompt includes bound variables, use them directly.
 - Call tools with `call tool_name { arg: expr }`. Tool calls return `{ ok, value/error }` wrappers; use `(call tool_name { arg: expr })?` for the normal fail-fast path.
 - Start background work with `start call tool_name { arg: expr }`, wait with `await handle`, and stop it with `cancel handle`. Prefer `await { name: handle }` for multiple handles so results are named. Use `(await handle)?` for the normal fail-fast path.
-- Use `print expr` to inspect a value mid-turn (keeps running). Use `submit <expr>` to end with a final answer.
-- In `for` loops, `break` exits the nearest loop and `continue` skips to the next iteration. `submit` still exits the whole turn.
+- Use `print expr` to inspect a value mid-turn (keeps running). Use `finish <expr>` to end with a final answer.
+- In `for` loops, `break` exits the nearest loop and `continue` skips to the next iteration. `finish` exits the whole turn.
 - Break large tasks into smaller, bounded steps instead of brute-force scanning."#
     } else {
         r#"In this mode you work by writing `lashlang` code inside your response and the runtime executes it.
@@ -890,8 +921,8 @@ print result
 
 - Wrap each work step in exactly one ` ```lashlang ` fenced block. Only the first block runs per turn.
 - Keep prose short. It is only a compact reasoning trace.
-- After each result, either write another fenced block to continue or call `submit <value>` from inside a fenced `lashlang` block to end the turn.
-- When you are done, call `submit <value>` from inside a fenced `lashlang` block. Do not end in prose without a fenced block.
+- After each result, either write another fenced block to continue or call `finish <value>` from inside a fenced `lashlang` block to end the turn.
+- When you are done, call `finish <value>` from inside a fenced `lashlang` block. Do not end in prose without a fenced block.
 - Variables persist across iterations.
 - You can update variable-rooted collection paths: `record.field = value`, `record[key] = value`, `list[i] = value`, and nested forms. Record assignment inserts/replaces fields; list assignment replaces an existing integer index only. Dynamic record reads return `null` when missing, so `counts[g] = counts[g] + 1` works for histograms.
 - If the prompt includes bound variables, use them directly.
@@ -902,8 +933,8 @@ print result
 - If the history is large, work hierarchically: narrow candidate sessions or date ranges first, then inspect those candidates, then verify the final answer.
 - Use `spawn_agent` for focused recursive subproblems such as narrowing candidate sessions, extracting date candidates, or verifying one hypothesis.
 - Keep each child task bounded and concrete. Do not fan out one agent per session unless the narrowed candidate set is already small.
-- Use `print expr` to inspect a value mid-turn (keeps running). Use `submit <expr>` for the final answer.
-- In `for` loops, `break` exits the nearest loop and `continue` skips to the next iteration. `submit` still exits the whole turn.
+- Use `print expr` to inspect a value mid-turn (keeps running). Use `finish <expr>` for the final answer.
+- In `for` loops, `break` exits the nearest loop and `continue` skips to the next iteration. `finish` exits the whole turn.
 - Avoid printing the entire haystack unless it is already small."#
     })];
     if matches!(profile, PromptProfile::TemporalObservations) {
@@ -979,8 +1010,8 @@ fn read_env_var(name: &str) -> Option<String> {
 
 fn parse_execution_mode(raw: &str) -> anyhow::Result<ExecutionMode> {
     match raw {
-        "rlm" => Ok(ExecutionMode::new("rlm")),
-        "standard" => Ok(ExecutionMode::standard()),
+        "rlm" => Ok(ExecutionMode::Rlm),
+        "standard" => Ok(ExecutionMode::Standard),
         _ => bail!("unsupported execution mode `{raw}`"),
     }
 }
@@ -999,7 +1030,7 @@ fn resolve_standard_context_approach(
     execution_mode: &ExecutionMode,
     raw: Option<&str>,
 ) -> anyhow::Result<Option<StandardContextApproach>> {
-    if *execution_mode == ExecutionMode::standard() {
+    if *execution_mode == ExecutionMode::Standard {
         return parse_standard_context_approach(raw.unwrap_or(DEFAULT_CONTEXT_APPROACH)).map(Some);
     }
     if raw.is_some() {
@@ -1009,7 +1040,7 @@ fn resolve_standard_context_approach(
 }
 
 fn execution_mode_label(mode: &ExecutionMode) -> &str {
-    mode.plugin_id()
+    mode.label()
 }
 
 fn standard_context_approach_label(approach: &StandardContextApproach) -> &'static str {
@@ -1056,10 +1087,11 @@ fn aggregate_usage(reports: impl IntoIterator<Item = SessionUsageReport>) -> Ses
         for row in report.by_source_model {
             let key = (row.source.clone(), row.model.clone());
             let entry = total.entry(key).or_default();
-            entry.input_tokens += row.usage.input_tokens;
-            entry.output_tokens += row.usage.output_tokens;
-            entry.cached_input_tokens += row.usage.cached_input_tokens;
-            entry.reasoning_tokens += row.usage.reasoning_tokens;
+            entry.input_tokens += row.usage.usage.input_tokens;
+            entry.output_tokens += row.usage.usage.output_tokens;
+            entry.cache_read_input_tokens += row.usage.usage.cache_read_input_tokens;
+            entry.cache_write_input_tokens += row.usage.usage.cache_write_input_tokens;
+            entry.reasoning_output_tokens += row.usage.usage.reasoning_output_tokens;
         }
     }
     let entries = total
@@ -1138,12 +1170,12 @@ fn write_summary_text(path: PathBuf, summary: &RunSummary) -> anyhow::Result<()>
 fn format_usage_line(label: &str, usage: &UsageTotals) -> String {
     format!(
         "{label}: input={} cached={} output={} reasoning={} total={} context_total={}",
-        usage.input_tokens,
-        usage.cached_input_tokens,
-        usage.output_tokens,
-        usage.reasoning_tokens,
+        usage.usage.input_tokens,
+        usage.usage.cache_read_input_tokens,
+        usage.usage.output_tokens,
+        usage.usage.reasoning_output_tokens,
         usage.total_tokens,
-        usage.context_total_tokens
+        usage.total_tokens
     )
 }
 
@@ -1337,12 +1369,15 @@ impl JsonlEventSink {
 #[async_trait::async_trait]
 impl EventSink for JsonlEventSink {
     async fn emit(&self, event: SessionEvent) {
-        if let SessionEvent::LlmRequest { mode_iteration, .. } = &event {
+        if let SessionEvent::LlmRequest {
+            protocol_iteration, ..
+        } = &event
+        {
             if let Ok(mut count) = self.llm_call_count.lock() {
                 *count += 1;
             }
             if let Ok(mut iterations) = self.llm_iterations.lock() {
-                iterations.insert(*mode_iteration);
+                iterations.insert(*protocol_iteration);
             }
         }
         if let SessionEvent::LlmResponse { content, .. } = &event
@@ -1383,13 +1418,13 @@ impl EventSink for JsonlEventSink {
 fn turn_completed(outcome: &TurnOutcome) -> bool {
     matches!(
         outcome,
-        TurnOutcome::Finished(_) | TurnOutcome::Handoff { .. }
+        TurnOutcome::Finished(_) | TurnOutcome::AgentFrameSwitch { .. }
     )
 }
 
 fn turn_status_label(outcome: &TurnOutcome) -> &'static str {
     match outcome {
-        TurnOutcome::Finished(_) | TurnOutcome::Handoff { .. } => "completed",
+        TurnOutcome::Finished(_) | TurnOutcome::AgentFrameSwitch { .. } => "completed",
         TurnOutcome::Stopped(TurnStop::Cancelled) => "interrupted",
         TurnOutcome::Stopped(_) => "failed",
     }
@@ -1398,9 +1433,9 @@ fn turn_status_label(outcome: &TurnOutcome) -> &'static str {
 fn done_reason_label(outcome: &TurnOutcome) -> &'static str {
     match outcome {
         TurnOutcome::Finished(TurnFinish::AssistantMessage { .. }) => "assistant_message",
-        TurnOutcome::Finished(TurnFinish::SubmittedValue { .. }) => "submitted_value",
+        TurnOutcome::Finished(TurnFinish::FinalValue { .. }) => "final_value",
         TurnOutcome::Finished(TurnFinish::ToolValue { .. }) => "tool_value",
-        TurnOutcome::Handoff { .. } => "handoff",
+        TurnOutcome::AgentFrameSwitch { .. } => "agent_frame_switch",
         TurnOutcome::Stopped(TurnStop::Cancelled) => "cancelled",
         TurnOutcome::Stopped(TurnStop::Incomplete) => "incomplete",
         TurnOutcome::Stopped(TurnStop::InvalidInput) => "invalid_input",
@@ -1419,8 +1454,9 @@ fn context_tokens_for_usage(usage: &TokenUsage) -> i64 {
         .input_tokens
         .max(0)
         .saturating_add(usage.output_tokens.max(0))
-        .saturating_add(usage.reasoning_tokens.max(0))
-        .saturating_add(usage.cached_input_tokens.max(0))
+        .saturating_add(usage.reasoning_output_tokens.max(0))
+        .saturating_add(usage.cache_read_input_tokens.max(0))
+        .saturating_add(usage.cache_write_input_tokens.max(0))
 }
 
 fn non_empty_text(text: &str) -> Option<String> {
@@ -1474,8 +1510,9 @@ mod tests {
         assert!(!budget.record(&TokenUsage {
             input_tokens: 40,
             output_tokens: 5,
-            cached_input_tokens: 10,
-            reasoning_tokens: 0,
+            cache_read_input_tokens: 10,
+            cache_write_input_tokens: 0,
+            reasoning_output_tokens: 0,
         }));
         assert_eq!(budget.observed_context_tokens, 55);
         assert!(!budget.exceeded);
@@ -1487,14 +1524,16 @@ mod tests {
         assert!(!budget.record(&TokenUsage {
             input_tokens: 45,
             output_tokens: 5,
-            cached_input_tokens: 0,
-            reasoning_tokens: 0,
+            cache_read_input_tokens: 0,
+            cache_write_input_tokens: 0,
+            reasoning_output_tokens: 0,
         }));
         assert!(budget.record(&TokenUsage {
             input_tokens: 40,
             output_tokens: 0,
-            cached_input_tokens: 20,
-            reasoning_tokens: 0,
+            cache_read_input_tokens: 20,
+            cache_write_input_tokens: 0,
+            reasoning_output_tokens: 0,
         }));
         assert_eq!(budget.observed_context_tokens, 110);
         assert!(budget.exceeded);

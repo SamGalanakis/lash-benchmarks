@@ -20,7 +20,7 @@ lash-llm-tools = { workspace = true }
 lash-mode-rlm = { workspace = true }
 lash-rlm-types = { workspace = true }
 lash-provider-openai = { workspace = true }
-lash-providers-builtin = { workspace = true }
+lash-lashlang-runtime = { workspace = true }
 lash-subagents = { workspace = true }
 tokio = { workspace = true, features = ["full"] }
 tokio-util = { workspace = true, features = ["rt"] }

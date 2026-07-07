@@ -16,15 +16,11 @@ lash-core = { workspace = true, features = ["testing"] }
 lash-standard-plugins = { workspace = true }
 lash-sqlite-store = { workspace = true }
 lash-plugin-observational-memory = { workspace = true }
-lash-plugin-rolling-history = { workspace = true }
-lash-plugin-tool-discovery = { workspace = true }
+lash-lashlang-runtime = { workspace = true }
 lash-mode-rlm = { workspace = true }
 lash-mode-standard = { workspace = true }
-lash-tool-apply-patch = { workspace = true }
-lash-tool-files = { workspace = true }
-lash-tool-search = { workspace = true }
-lash-tool-shell = { workspace = true }
-lash-providers-builtin = { workspace = true }
+lash-search-tools = { workspace = true }
+lash-tools = { workspace = true }
 tokio = { workspace = true, features = ["full"] }
 tokio-util = { workspace = true, features = ["rt"] }
 clap = { workspace = true, features = ["derive", "env"] }

@@ -12,7 +12,6 @@ path = "src/lib.rs"
 [dependencies]
 lash-core = { workspace = true }
 lash-provider-anthropic = { workspace = true }
-lash-provider-codex = { workspace = true }
 lash-provider-google = { workspace = true }
 lash-provider-openai = { workspace = true }
 anyhow = { workspace = true }

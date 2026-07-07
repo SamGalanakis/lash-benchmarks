@@ -20,8 +20,7 @@ lash-llm-tools = { workspace = true }
 lash-mode-rlm = { workspace = true }
 lash-mode-standard = { workspace = true }
 lash-plugin-observational-memory = { workspace = true }
-lash-plugin-rolling-history = { workspace = true }
-lash-providers-builtin = { workspace = true }
+lash-lashlang-runtime = { workspace = true }
 lash-subagents = { workspace = true }
 tokio = { workspace = true, features = ["full"] }
 tokio-util = { workspace = true, features = ["rt"] }

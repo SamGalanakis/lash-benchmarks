@@ -10,35 +10,32 @@ use anyhow::{Context, bail};
 use async_trait::async_trait;
 use chrono::Utc;
 use clap::Parser;
+use lash::plugins::ToolOutputBudgetPluginFactory;
 use lash::{
-    LashCore, ModeId, ModePreset, SessionSpec, TurnInput,
-    advanced::{
-        EventSink, ExecutionMode, ModeTurnOptions, TurnContext, TurnFinish, TurnOutcome, TurnStop,
-    },
-    plugins::{PluginFactory, PluginHost, PluginSpec, StaticPluginFactory},
+    LashCore, ModelSpec, PluginStack, PromptLayerSink, SessionSpec, TurnFinish, TurnInput,
+    TurnOutcome, TurnStop,
+    plugins::{PluginFactory, PluginSpec, StaticPluginFactory},
     prompt::{
         PromptBuiltin, PromptSlot, PromptTemplate, PromptTemplateEntry, PromptTemplateSection,
     },
     provider::{ProviderHandle, ProviderOptions},
+    rlm::RlmTurnBuilderExt,
     tools::{
-        ToolCall, ToolContract, ToolDefinition, ToolExecutionMode, ToolManifest, ToolProvider,
-        ToolResult,
+        ToolCall, ToolContract, ToolDefinition, ToolManifest, ToolProvider, ToolResult,
+        ToolScheduling,
     },
     usage::{SessionUsageReport, TokenLedgerEntry, TokenUsage, diff_usage_reports},
 };
 use lash_cli::config::LashConfig;
-use lash_core::{InputItem, SessionEvent, ToolOutputBudgetPluginFactory};
+use lash_core::{EventSink, ExecutionScope, RuntimeHostConfig, SessionEvent};
 use lash_export::{ExportFormat, export};
 use lash_llm_tools::LlmToolsPluginFactory;
 use lash_mode_rlm::{
-    BuiltinRlmModePluginFactory, RlmModePluginConfig, RlmPromptFeatures, RlmTurnInputExt,
+    RlmPromptFeatures, RlmProtocolPluginConfig, RlmProtocolPluginFactory, RlmTurnInputExt,
 };
 use lash_provider_openai::OPENROUTER_BASE_URL;
-use lash_rlm_types::RlmTermination;
 use lash_sqlite_store::Store;
-use lash_subagents::{
-    CapabilityRegistry, LocalSubagentHost, StaticCapability, SubagentHost, SubagentsPluginFactory,
-};
+use lash_subagents::{CapabilityRegistry, StaticCapability, SubagentsPluginFactory};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use tokio::sync::Semaphore;
@@ -57,7 +54,7 @@ const SUBAGENT_CAPABILITY: &str = "default";
 
 const FRONTIER_USER_DIRECTIVE: &str = concat!(
     "Solve the Frontier-CS problem bound as `problem`. ",
-    "Reason carefully, decompose with subagents when useful, and submit only the complete source code as a string. ",
+    "Reason carefully, decompose with subagents when useful, and finish with only the complete source code as a string. ",
     "Do not wrap the final answer in markdown fences."
 );
 
@@ -295,7 +292,6 @@ struct FrontierEvalRow {
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let _ = dotenvy::dotenv();
-    lash_providers_builtin::register_all();
 
     let args = Args::parse();
     if !args.source_dir.join("pyproject.toml").exists() {
@@ -630,24 +626,28 @@ async fn run_problem(
     let store_path = problem_dir.join("session.db");
     let trace_path = problem_dir.join("session.trace.jsonl");
     let store = Arc::new(
-        Store::open(&store_path).with_context(|| format!("open {}", store_path.display()))?,
+        Store::open(&store_path)
+            .await
+            .with_context(|| format!("open {}", store_path.display()))?,
     );
-    let execution_mode = ExecutionMode::new(EXECUTION_MODE_LABEL);
-    let core = LashCore::builder()
-        .install_mode(ModePreset::rlm())
-        .default_mode(ModeId::rlm())
+    let model = model_spec(
+        args.model.clone(),
+        Some(args.variant.clone()),
+        args.max_context_tokens,
+        args.max_output_tokens,
+    )?;
+    let core = LashCore::rlm_builder(rlm_protocol_factory(rlm_config()))
         .provider(provider.clone())
-        .model(args.model.clone(), Some(args.variant.clone()))
-        .max_context_tokens(args.max_context_tokens)
+        .model(model)
         .max_turns(args.max_turns)
         .prompt_template(frontier_prompt_template())
-        .trace_jsonl_path(Some(trace_path.clone()))
+        .trace_jsonl_path(trace_path.clone())
+        .plugins(build_plugin_stack(args)?)
         .advanced()
-        .plugin_host(build_plugin_host(execution_mode.clone(), args))
+        .runtime_host_config(RuntimeHostConfig::in_memory())
         .build()?;
     let session = core
         .session(format!("frontier-cs-{}", problem.problem_id))
-        .rlm()
         .store(store.clone())
         .open()
         .await?;
@@ -657,39 +657,31 @@ async fn run_problem(
     let cancel = tokio_util::sync::CancellationToken::new();
     let sink = Arc::new(FrontierEventSink::new(problem_dir.join("events.jsonl"))?);
     let sink_trait: Arc<dyn EventSink> = sink.clone();
-    let input = TurnInput {
-        items: vec![InputItem::Text {
-            text: FRONTIER_USER_DIRECTIVE.to_string(),
-        }],
-        image_blobs: Default::default(),
-        mode_turn_options: Some(ModeTurnOptions::typed(
-            execution_mode,
-            RlmTermination::SubmitRequired {
-                schema: Some(json!({ "type": "string" })),
-            },
-        )?),
-        trace_turn_id: None,
-        mode_extension: None,
-        turn_context: TurnContext::default(),
-    }
-    .rlm_project(build_projected_bindings(&problem)?)?;
+    let input = TurnInput::text(FRONTIER_USER_DIRECTIVE)
+        .rlm_project(build_projected_bindings(&problem)?)?;
+    let effect_host = core.effect_host();
+    let scoped = effect_host.scoped(ExecutionScope::turn(
+        format!("frontier-cs-{}", problem.problem_id),
+        "frontier-turn",
+    ))?;
     let turn_result = session
         .turn(input)
+        .turn_id("frontier-turn")
+        .require_finish_schema(json!({ "type": "string" }))?
         .cancel(cancel)
-        .collect_session_events_with(sink_trait.as_ref())
+        .advanced()
+        .collect_session_events_with_scope(sink_trait.as_ref(), scoped)
         .await;
     let background_result = if args.await_background_work && turn_result.is_ok() {
-        session.background_tasks().await_all().await
+        session.refresh_background_graph().await
     } else {
         Ok(())
     };
-    let cancelled = session.background_tasks().cancel_all().await?;
-    if !cancelled.is_empty() {
+    let cancelled = session.cancel_running_turns();
+    if cancelled != 0 {
         eprintln!(
             "  cancelled {} background task(s) after {}/{}",
-            cancelled.len(),
-            problem.track,
-            problem.problem_id
+            cancelled, problem.track, problem.problem_id
         );
     }
     background_result?;
@@ -766,7 +758,9 @@ async fn run_problem(
         &trace_path,
         ExportFormat::Html,
         Some(&html_trace_path),
-    ) {
+    )
+    .await
+    {
         eprintln!(
             "warn: failed to render HTML trace for {}/{}: {err:#}",
             problem.track, problem.problem_id
@@ -853,17 +847,17 @@ For algorithmic tasks:
 1. Read the full statement and infer the input/output protocol exactly.
 2. Design the strongest practical algorithm you can within the stated limits.
 3. Use `llm_query` or `spawn_agent` to independently check tricky cases, proof obligations, and implementation details.
-4. Submit exactly one complete C++17 file as a string. No markdown fences.
+4. Finish with exactly one complete C++17 file as a string. No markdown fences.
 
 For research tasks:
 1. Read the readme interface carefully and implement the required `Solution` class.
 2. Prefer a robust baseline that runs inside the official evaluator over fragile, environment-specific tricks.
-3. Submit exactly one complete Python file as a string. No markdown fences.
+3. Finish with exactly one complete Python file as a string. No markdown fences.
 
 You do not have shell or filesystem tools during generation. The host will write the submitted source file and run Frontier-CS evaluation after generation."#;
 
-fn build_plugin_host(execution_mode: ExecutionMode, args: &Args) -> PluginHost {
-    let child_spec = child_session_spec(args, execution_mode.clone());
+fn build_plugin_stack(args: &Args) -> anyhow::Result<PluginStack> {
+    let child_spec = child_session_spec(args)?;
     let llm_tools = match (&args.child_model, &args.child_variant) {
         (Some(model), variant) => {
             LlmToolsPluginFactory::default().with_model(model.clone(), variant.clone())
@@ -875,49 +869,71 @@ fn build_plugin_host(execution_mode: ExecutionMode, args: &Args) -> PluginHost {
     };
     let factories: Vec<Arc<dyn PluginFactory>> = vec![
         Arc::new(ToolOutputBudgetPluginFactory::default()),
-        Arc::new(BuiltinRlmModePluginFactory::new(rlm_config())),
         Arc::new(llm_tools),
         Arc::new(StaticPluginFactory::new(
             "frontier_async_handles",
             PluginSpec::new().with_tool_provider(Arc::new(FrontierAsyncHandlesTool)),
         )),
         Arc::new(
-            SubagentsPluginFactory::new(
-                Arc::new(
-                    CapabilityRegistry::new().with(Arc::new(StaticCapability::new(
-                        SUBAGENT_CAPABILITY,
-                        child_spec,
-                    ))),
-                ),
-                Arc::new(LocalSubagentHost::default()) as Arc<dyn SubagentHost>,
-            )
+            SubagentsPluginFactory::new(Arc::new(CapabilityRegistry::new().with(Arc::new(
+                StaticCapability::new(SUBAGENT_CAPABILITY, child_spec),
+            ))))
             .with_session_spec(SessionSpec::inherit()),
         ),
     ];
-    PluginHost::new(factories)
+    Ok(PluginStack::from_factories(factories))
 }
 
-fn child_session_spec(args: &Args, execution_mode: ExecutionMode) -> SessionSpec {
-    let mut spec = SessionSpec::inherit().mode(execution_mode);
+fn child_session_spec(args: &Args) -> anyhow::Result<SessionSpec> {
+    let mut spec = SessionSpec::inherit();
     if let Some(child_model) = args.child_model.as_ref() {
-        spec = spec.model(child_model, args.child_variant.clone());
+        spec = spec.model(model_spec(
+            child_model.clone(),
+            args.child_variant.clone(),
+            args.max_context_tokens,
+            args.max_output_tokens,
+        )?);
     } else if let Some(child_variant) = args.child_variant.as_ref() {
-        spec = spec.model_variant(child_variant);
+        spec = spec.model(model_spec(
+            args.model.clone(),
+            Some(child_variant.clone()),
+            args.max_context_tokens,
+            args.max_output_tokens,
+        )?);
     }
     if let Some(max_turns) = args.child_max_turns {
         spec = spec.max_turns(max_turns);
     }
-    spec
+    Ok(spec)
 }
 
-fn rlm_config() -> RlmModePluginConfig {
-    RlmModePluginConfig {
+fn model_spec(
+    model: String,
+    variant: Option<String>,
+    max_context_tokens: usize,
+    max_output_tokens: u64,
+) -> anyhow::Result<ModelSpec> {
+    let output_cap = (max_output_tokens > 0).then_some(max_output_tokens as usize);
+    ModelSpec::from_token_limits(model, variant, max_context_tokens, output_cap)
+        .map_err(anyhow::Error::msg)
+}
+
+fn rlm_config() -> RlmProtocolPluginConfig {
+    RlmProtocolPluginConfig {
         prompt_features: RlmPromptFeatures {
             images: false,
             ..RlmPromptFeatures::default()
         },
-        ..RlmModePluginConfig::default()
+        ..RlmProtocolPluginConfig::default()
     }
+}
+
+fn rlm_protocol_factory(config: RlmProtocolPluginConfig) -> RlmProtocolPluginFactory {
+    RlmProtocolPluginFactory::new(
+        config,
+        Arc::new(lash_lashlang_runtime::InMemoryLashlangArtifactStore::new()),
+    )
+    .with_process_lifecycle(false)
 }
 
 struct FrontierAsyncHandlesTool;
@@ -943,21 +959,22 @@ impl ToolProvider for FrontierAsyncHandlesTool {
 
 fn frontier_list_async_handles_tool_definition() -> ToolDefinition {
     ToolDefinition::raw(
-            "list_async_handles",
-            "List live lashlang async handles only. Returns `{ monitor: { monitor_id: handle }, subagent: { name: handle }, tool: { id: handle } }`; terminal, awaited, or cancelled handles are omitted.",
-            ToolDefinition::default_input_schema(),
-            json!({
-                "type": "object",
-                "properties": {
-                    "monitor": { "type": "object" },
-                    "subagent": { "type": "object" },
-                    "tool": { "type": "object" }
-                },
-                "required": ["monitor", "subagent", "tool"]
-            }),
-        )
-        .with_examples(vec![r#"handles = (call list_async_handles {})?"#.into()])
-        .with_execution_mode(ToolExecutionMode::Parallel)
+        "tool:list_async_handles",
+        "list_async_handles",
+        "List live lashlang async handles only. Returns `{ monitor: { monitor_id: handle }, subagent: { name: handle }, tool: { id: handle } }`; terminal, awaited, or cancelled handles are omitted.",
+        ToolDefinition::default_input_schema(),
+        json!({
+            "type": "object",
+            "properties": {
+                "monitor": { "type": "object" },
+                "subagent": { "type": "object" },
+                "tool": { "type": "object" }
+            },
+            "required": ["monitor", "subagent", "tool"]
+        }),
+    )
+    .with_examples(vec![r#"handles = (call list_async_handles {})?"#.into()])
+    .with_scheduling(ToolScheduling::Parallel)
 }
 
 fn evaluate_solution(
@@ -1016,7 +1033,7 @@ fn evaluate_solution(
 }
 
 fn solution_from_turn(outcome: &TurnOutcome, assistant_text: &str) -> String {
-    if let TurnOutcome::Finished(TurnFinish::SubmittedValue { value }) = outcome {
+    if let TurnOutcome::Finished(TurnFinish::FinalValue { value }) = outcome {
         return match value {
             Value::String(text) => text.clone(),
             other => other.to_string(),
@@ -1111,13 +1128,13 @@ fn read_env_var(name: &str) -> Option<String> {
 fn turn_completed(outcome: &TurnOutcome) -> bool {
     matches!(
         outcome,
-        TurnOutcome::Finished(_) | TurnOutcome::Handoff { .. }
+        TurnOutcome::Finished(_) | TurnOutcome::AgentFrameSwitch { .. }
     )
 }
 
 fn turn_status_label(outcome: &TurnOutcome) -> &'static str {
     match outcome {
-        TurnOutcome::Finished(_) | TurnOutcome::Handoff { .. } => "completed",
+        TurnOutcome::Finished(_) | TurnOutcome::AgentFrameSwitch { .. } => "completed",
         TurnOutcome::Stopped(TurnStop::Cancelled) => "interrupted",
         TurnOutcome::Stopped(_) => "failed",
     }
@@ -1126,9 +1143,9 @@ fn turn_status_label(outcome: &TurnOutcome) -> &'static str {
 fn done_reason_label(outcome: &TurnOutcome) -> &'static str {
     match outcome {
         TurnOutcome::Finished(TurnFinish::AssistantMessage { .. }) => "assistant_message",
-        TurnOutcome::Finished(TurnFinish::SubmittedValue { .. }) => "submitted_value",
+        TurnOutcome::Finished(TurnFinish::FinalValue { .. }) => "final_value",
         TurnOutcome::Finished(TurnFinish::ToolValue { .. }) => "tool_value",
-        TurnOutcome::Handoff { .. } => "handoff",
+        TurnOutcome::AgentFrameSwitch { .. } => "agent_frame_switch",
         TurnOutcome::Stopped(TurnStop::Cancelled) => "cancelled",
         TurnOutcome::Stopped(TurnStop::Incomplete) => "incomplete",
         TurnOutcome::Stopped(TurnStop::InvalidInput) => "invalid_input",
@@ -1202,10 +1219,10 @@ fn aggregate_usage(reports: impl IntoIterator<Item = SessionUsageReport>) -> Ses
         for row in report.by_source_model {
             let key = (row.source.clone(), row.model.clone());
             let entry = total.entry(key).or_default();
-            entry.input_tokens += row.usage.input_tokens;
-            entry.output_tokens += row.usage.output_tokens;
-            entry.cached_input_tokens += row.usage.cached_input_tokens;
-            entry.reasoning_tokens += row.usage.reasoning_tokens;
+            entry.input_tokens += row.usage.usage.input_tokens;
+            entry.output_tokens += row.usage.usage.output_tokens;
+            entry.cache_read_input_tokens += row.usage.usage.cache_read_input_tokens;
+            entry.reasoning_output_tokens += row.usage.usage.reasoning_output_tokens;
         }
     }
     let entries = total
@@ -1465,9 +1482,11 @@ impl FrontierEventSink {
 impl EventSink for FrontierEventSink {
     async fn emit(&self, event: SessionEvent) {
         match &event {
-            SessionEvent::LlmRequest { mode_iteration, .. } => {
+            SessionEvent::LlmRequest {
+                protocol_iteration, ..
+            } => {
                 if let Ok(mut turns) = self.iteration_count.lock() {
-                    turns.insert(*mode_iteration);
+                    turns.insert(*protocol_iteration);
                 }
                 if let Ok(mut calls) = self.root_llm_calls.lock() {
                     *calls += 1;

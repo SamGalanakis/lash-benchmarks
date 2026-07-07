@@ -68,7 +68,7 @@ The Rust runner registers an explicit RLM tool surface for benchmark hygiene:
   MCP, and AppWorld tools
 
 Each turn passes CLBench's current `response_schema` into RLM as the required
-`submit` schema, so the model receives runtime feedback if `submit <value>` does
+`finish` schema, so the model receives runtime feedback if `finish <value>` does
 not match the benchmark step.
 
 `spawn_agent` and `continue_as` both accept a `seed:` channel — each entry is

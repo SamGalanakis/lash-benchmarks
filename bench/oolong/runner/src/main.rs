@@ -12,36 +12,33 @@ use async_trait::async_trait;
 use chrono::Utc;
 use clap::{Parser, ValueEnum};
 use dataset::{OolongQuestion, OolongSuite, default_dataset_path, load_questions};
+use lash::plugins::ToolOutputBudgetPluginFactory;
 use lash::{
-    LashCore, ModeId, ModePreset, SessionSpec, TurnInput,
-    advanced::{
-        EventSink, ExecutionMode, ModeTurnOptions, TurnContext, TurnFinish, TurnOutcome, TurnStop,
-    },
-    plugins::{PluginFactory, PluginHost, PluginSpec, StaticPluginFactory},
+    LashCore, ModelSpec, PluginStack, PromptLayerSink, SessionSpec, TurnFinish, TurnInput,
+    TurnOutcome, TurnStop,
+    plugins::{PluginFactory, PluginSpec, StaticPluginFactory},
     prompt::{
         PromptBuiltin, PromptLayer, PromptSlot, PromptTemplate, PromptTemplateEntry,
         PromptTemplateSection,
     },
     provider::{ProviderHandle, ProviderOptions},
+    rlm::RlmTurnBuilderExt,
     tools::{
-        ToolCall, ToolContract, ToolDefinition, ToolExecutionMode, ToolManifest, ToolProvider,
-        ToolResult,
+        ToolCall, ToolContract, ToolDefinition, ToolManifest, ToolProvider, ToolResult,
+        ToolScheduling,
     },
     usage::{SessionUsageReport, TokenLedgerEntry, TokenUsage, diff_usage_reports},
 };
 use lash_cli::config::LashConfig;
-use lash_core::{InputItem, SessionEvent, ToolOutputBudgetPluginFactory};
+use lash_core::{EventSink, ExecutionScope, RuntimeHostConfig, SessionEvent};
 use lash_export::{ExportFormat, export};
 use lash_llm_tools::LlmToolsPluginFactory;
 use lash_mode_rlm::{
-    BuiltinRlmModePluginFactory, RlmModePluginConfig, RlmPromptFeatures, RlmTurnInputExt,
+    RlmPromptFeatures, RlmProtocolPluginConfig, RlmProtocolPluginFactory, RlmTurnInputExt,
 };
 use lash_provider_openai::OPENROUTER_BASE_URL;
-use lash_rlm_types::RlmTermination;
 use lash_sqlite_store::Store;
-use lash_subagents::{
-    CapabilityRegistry, LocalSubagentHost, StaticCapability, SubagentHost, SubagentsPluginFactory,
-};
+use lash_subagents::{CapabilityRegistry, StaticCapability, SubagentsPluginFactory};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use tokio::task::JoinSet;
@@ -59,7 +56,7 @@ const DEFAULT_BATCH_SIZE: usize = 4;
 const OOLONG_USER_DIRECTIVE: &str = concat!(
     "Answer the OOLONG aggregation question bound as `input.question` using the long context bound as `input.context`. ",
     "Do not guess or approximate. Inspect the context in slices, classify/count exactly, and use recursive subagents when useful. ",
-    "End by submitting only the final answer value with `submit` from a fenced `lashlang` block."
+    "End by calling `finish <value>` with only the final answer value from a fenced `lashlang` block."
 );
 
 #[derive(Clone, Copy, Debug, ValueEnum)]
@@ -352,7 +349,6 @@ struct TimingSummary {
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let _ = dotenvy::dotenv();
-    lash_providers_builtin::register_all();
 
     let args = Args::parse();
     let suite: OolongSuite = args.suite.into();
@@ -688,65 +684,55 @@ async fn run_question(
     let store_path = question_dir.join("session.db");
     let trace_path = question_dir.join("session.trace.jsonl");
     let store = Arc::new(
-        Store::open(&store_path).with_context(|| format!("open {}", store_path.display()))?,
+        Store::open(&store_path)
+            .await
+            .with_context(|| format!("open {}", store_path.display()))?,
     );
-    let execution_mode = ExecutionMode::new(EXECUTION_MODE_LABEL);
-    let core = LashCore::builder()
-        .install_mode(ModePreset::rlm())
-        .default_mode(ModeId::rlm())
+    let model = model_spec(
+        args.model.clone(),
+        Some(args.variant.clone()),
+        args.max_context_tokens,
+        args.max_output_tokens,
+    )?;
+    let core = LashCore::rlm_builder(rlm_protocol_factory(rlm_config(args)))
         .provider(provider.clone())
-        .model(args.model.clone(), Some(args.variant.clone()))
-        .max_context_tokens(args.max_context_tokens)
+        .model(model)
         .max_turns(args.max_turns)
         .prompt_template(oolong_prompt_template())
-        .trace_jsonl_path(Some(trace_path.clone()))
+        .trace_jsonl_path(trace_path.clone())
+        .plugins(build_plugin_stack(args)?)
         .advanced()
-        .plugin_host(build_plugin_host(execution_mode.clone(), args))
+        .runtime_host_config(RuntimeHostConfig::in_memory())
         .build()?;
-    let session = core
-        .session("root")
-        .rlm()
-        .store(store.clone())
-        .open()
-        .await?;
+    let session = core.session("root").store(store.clone()).open().await?;
 
     let before_usage = session.usage_report();
     let started = std::time::Instant::now();
     let cancel = tokio_util::sync::CancellationToken::new();
     let sink = Arc::new(OolongEventSink::new(question_dir.join("events.jsonl"))?);
     let sink_trait: Arc<dyn EventSink> = sink.clone();
-    let input = TurnInput {
-        items: vec![InputItem::Text {
-            text: OOLONG_USER_DIRECTIVE.to_string(),
-        }],
-        image_blobs: Default::default(),
-        mode_turn_options: Some(ModeTurnOptions::typed(
-            execution_mode,
-            RlmTermination::SubmitRequired {
-                schema: Some(oolong_answer_schema(&question)),
-            },
-        )?),
-        trace_turn_id: None,
-        mode_extension: None,
-        turn_context: TurnContext::default(),
-    }
-    .rlm_project(build_projected_bindings(&question)?)?;
+    let input =
+        TurnInput::text(OOLONG_USER_DIRECTIVE).rlm_project(build_projected_bindings(&question)?)?;
+    let effect_host = core.effect_host();
+    let scoped = effect_host.scoped(ExecutionScope::turn("root", "oolong-turn"))?;
     let turn_result = session
         .turn(input)
+        .turn_id("oolong-turn")
+        .require_finish_schema(oolong_answer_schema(&question))?
         .cancel(cancel)
-        .collect_session_events_with(sink_trait.as_ref())
+        .advanced()
+        .collect_session_events_with_scope(sink_trait.as_ref(), scoped)
         .await;
     let background_result = if args.await_background_work && turn_result.is_ok() {
-        session.background_tasks().await_all().await
+        session.refresh_background_graph().await
     } else {
         Ok(())
     };
-    let cancelled = session.background_tasks().cancel_all().await?;
-    if !cancelled.is_empty() {
+    let cancelled = session.cancel_running_turns();
+    if cancelled != 0 {
         eprintln!(
             "  cancelled {} background task(s) after {}",
-            cancelled.len(),
-            question.question_id
+            cancelled, question.question_id
         );
     }
     background_result?;
@@ -819,7 +805,9 @@ async fn run_question(
         &trace_path,
         ExportFormat::Html,
         Some(&html_trace_path),
-    ) {
+    )
+    .await
+    {
         eprintln!(
             "warn: failed to render HTML trace for {}: {err:#}",
             question.question_id
@@ -921,7 +909,7 @@ fn label_choices_from_question(question: &str) -> Vec<String> {
 }
 
 fn prediction_from_turn(outcome: &TurnOutcome, assistant_text: &str) -> Value {
-    if let TurnOutcome::Finished(TurnFinish::SubmittedValue { value }) = outcome {
+    if let TurnOutcome::Finished(TurnFinish::FinalValue { value }) = outcome {
         return value.clone();
     }
     parse_answerish_value(assistant_text)
@@ -1049,8 +1037,8 @@ fn extract_text(content: Option<&Value>) -> String {
     }
 }
 
-fn build_plugin_host(execution_mode: ExecutionMode, args: &Args) -> PluginHost {
-    let child_spec = child_session_spec(args, execution_mode.clone());
+fn build_plugin_stack(args: &Args) -> anyhow::Result<PluginStack> {
+    let child_spec = child_session_spec(args)?;
     let llm_tools = match (&args.child_model, &args.child_variant) {
         (Some(model), variant) => {
             LlmToolsPluginFactory::default().with_model(model.clone(), variant.clone())
@@ -1062,41 +1050,53 @@ fn build_plugin_host(execution_mode: ExecutionMode, args: &Args) -> PluginHost {
     };
     let factories: Vec<Arc<dyn PluginFactory>> = vec![
         Arc::new(ToolOutputBudgetPluginFactory::default()),
-        Arc::new(BuiltinRlmModePluginFactory::new(rlm_config(args))),
         Arc::new(llm_tools),
         Arc::new(StaticPluginFactory::new(
             "oolong_async_handles",
             PluginSpec::new().with_tool_provider(Arc::new(OolongAsyncHandlesTool)),
         )),
         Arc::new(
-            SubagentsPluginFactory::new(
-                Arc::new(
-                    CapabilityRegistry::new().with(Arc::new(StaticCapability::new(
-                        SUBAGENT_CAPABILITY,
-                        child_spec,
-                    ))),
-                ),
-                Arc::new(LocalSubagentHost::default()) as Arc<dyn SubagentHost>,
-            )
+            SubagentsPluginFactory::new(Arc::new(CapabilityRegistry::new().with(Arc::new(
+                StaticCapability::new(SUBAGENT_CAPABILITY, child_spec),
+            ))))
             .with_session_spec(SessionSpec::inherit()),
         ),
     ];
-    PluginHost::new(factories)
+    Ok(PluginStack::from_factories(factories))
 }
 
-fn child_session_spec(args: &Args, execution_mode: ExecutionMode) -> SessionSpec {
-    let mut spec = SessionSpec::inherit()
-        .mode(execution_mode)
-        .prompt_layer(oolong_child_prompt_layer());
+fn child_session_spec(args: &Args) -> anyhow::Result<SessionSpec> {
+    let mut spec = SessionSpec::inherit().prompt_layer(oolong_child_prompt_layer());
     if let Some(child_model) = args.child_model.as_ref() {
-        spec = spec.model(child_model, args.child_variant.clone());
+        spec = spec.model(model_spec(
+            child_model.clone(),
+            args.child_variant.clone(),
+            args.max_context_tokens,
+            args.max_output_tokens,
+        )?);
     } else if let Some(child_variant) = args.child_variant.as_ref() {
-        spec = spec.model_variant(child_variant);
+        spec = spec.model(model_spec(
+            args.model.clone(),
+            Some(child_variant.clone()),
+            args.max_context_tokens,
+            args.max_output_tokens,
+        )?);
     }
     if let Some(max_turns) = args.child_max_turns {
         spec = spec.max_turns(max_turns);
     }
-    spec
+    Ok(spec)
+}
+
+fn model_spec(
+    model: String,
+    variant: Option<String>,
+    max_context_tokens: usize,
+    max_output_tokens: u64,
+) -> anyhow::Result<ModelSpec> {
+    let output_cap = (max_output_tokens > 0).then_some(max_output_tokens as usize);
+    ModelSpec::from_token_limits(model, variant, max_context_tokens, output_cap)
+        .map_err(anyhow::Error::msg)
 }
 
 fn oolong_child_prompt_layer() -> PromptLayer {
@@ -1117,7 +1117,7 @@ fn oolong_child_prompt_layer() -> PromptLayer {
         PromptTemplateSection::titled(
             "Subagent Scope",
             vec![PromptTemplateEntry::text(
-                "Do not assume `input`, `benchmark`, or any parent globals exist unless they appear in Environment. If you need context, question text, metadata, chunks, records, or prior findings, read the seeded variable names the parent provided. Complete the assigned subproblem and submit only the requested value.",
+                "Do not assume `input`, `benchmark`, or any parent globals exist unless they appear in Environment. If you need context, question text, metadata, chunks, records, or prior findings, read the seeded variable names the parent provided. Complete the assigned subproblem and finish with only the requested value.",
             )],
         ),
         PromptTemplateSection::titled(
@@ -1137,26 +1137,30 @@ fn oolong_child_prompt_layer() -> PromptLayer {
     ]))
 }
 
-fn rlm_config(args: &Args) -> RlmModePluginConfig {
-    let mut config = RlmModePluginConfig {
+fn rlm_config(args: &Args) -> RlmProtocolPluginConfig {
+    let mut config = RlmProtocolPluginConfig {
         prompt_features: RlmPromptFeatures {
             images: false,
             ..RlmPromptFeatures::default()
         },
-        ..RlmModePluginConfig::default()
+        ..RlmProtocolPluginConfig::default()
     };
     if args.disable_continue_as_fallback {
         config.continue_as_soft_warn_tokens = None;
-        config.continue_as_forced_fallback_tokens = None;
     } else {
         if let Some(value) = args.soft_continue_as_tokens {
             config.continue_as_soft_warn_tokens = Some(value);
         }
-        if let Some(value) = args.forced_continue_as_tokens {
-            config.continue_as_forced_fallback_tokens = Some(value);
-        }
     }
     config
+}
+
+fn rlm_protocol_factory(config: RlmProtocolPluginConfig) -> RlmProtocolPluginFactory {
+    RlmProtocolPluginFactory::new(
+        config,
+        Arc::new(lash_lashlang_runtime::InMemoryLashlangArtifactStore::new()),
+    )
+    .with_process_lifecycle(false)
 }
 
 struct OolongAsyncHandlesTool;
@@ -1182,6 +1186,7 @@ impl ToolProvider for OolongAsyncHandlesTool {
 
 fn oolong_list_async_handles_tool_definition() -> ToolDefinition {
     ToolDefinition::raw(
+        "tool:list_async_handles",
         "list_async_handles",
         "List live lashlang async handles only. Returns `{ monitor: { monitor_id: handle }, subagent: { name: handle }, tool: { id: handle } }`; terminal, awaited, or cancelled handles are omitted. Use this after fan-out via `spawn_agent`.",
         ToolDefinition::default_input_schema(),
@@ -1196,7 +1201,7 @@ fn oolong_list_async_handles_tool_definition() -> ToolDefinition {
         }),
     )
     .with_examples(vec![r#"handles = (call list_async_handles {})?"#.into()])
-    .with_execution_mode(ToolExecutionMode::Parallel)
+    .with_scheduling(ToolScheduling::Parallel)
 }
 
 fn oolong_prompt_template() -> PromptTemplate {
@@ -1240,13 +1245,13 @@ const OOLONG_DECOMPOSITION_GUIDANCE: &str = r#"OOLONG rewards exact aggregation,
 Default pattern:
 1. Inspect metadata first: dataset, task_group, task, answer_type, context_len.
 2. Inspect the question and enough of the context to understand its structure before deciding the strategy. Identify the record boundary and the label/user/date fields before counting.
-3. Cover the full context before final submission. Prefer semantic boundaries over arbitrary ranges: records, lines, sections, examples, turns, rows, or other natural units from the input. If arbitrary ranges are necessary, use overlap and carry stable anchors so boundary cases can be reconciled.
+3. Cover the full context before the final answer. Prefer semantic boundaries over arbitrary ranges: records, lines, sections, examples, turns, rows, or other natural units from the input. If arbitrary ranges are necessary, use overlap and carry stable anchors so boundary cases can be reconciled.
 4. For contexts with many independent units, dispatch focused `spawn_agent` calls with `capability: "default"` over disjoint semantic work where possible. Pass only the needed state, such as `seed: { context: slice(input.context, start, end), question: input.question, metadata: benchmark }`.
 5. Give subagents narrow, auditable tasks. Prefer structured outputs with a list of atomic findings plus a general `notes` field. Each finding should include a stable source anchor, the extracted/classified value, and concise evidence. Use `notes` for assumptions, ambiguity, boundary issues, missing context, or anything the root should review.
-6. The root is responsible for reconciliation. Do not blindly combine subagent answers. Inspect returned evidence and notes, resolve conflicts, deduplicate overlaps, and investigate ambiguity before finalizing. If any partial result reports uncertainty, truncation, boundary risk, missing context, or inconsistent assumptions, run a targeted follow-up before submitting.
-7. Submit only the final answer value. If the required output schema lists choices, submit one of those raw values without prefixes like `Label:` or `Answer:`. If the expected answer is a label or user, submit a string; if it asks for multiple entries, submit an array; if it asks for a count, submit a number.
+6. The root is responsible for reconciliation. Do not blindly combine subagent answers. Inspect returned evidence and notes, resolve conflicts, deduplicate overlaps, and investigate ambiguity before finalizing. If any partial result reports uncertainty, truncation, boundary risk, missing context, or inconsistent assumptions, run a targeted follow-up before finishing.
+7. Finish with only the final answer value. If the required output schema lists choices, return one of those raw values without prefixes like `Label:` or `Answer:`. If the expected answer is a label or user, return a string; if it asks for multiple entries, return an array; if it asks for a count, return a number.
 
-Avoid copying the whole context into prose or printing whole document lists. Use short slices and compact projections to inspect structure and evidence. If a subtask requires its own multi-step inspection, use `spawn_agent`; if it is a small direct classification, extraction, summarization, or judgment over supplied data, `llm_query` is enough. Use `start call spawn_agent` plus `await`/`list_async_handles` for parallel fan-out when work is independent. Before final submission, perform one independent check appropriate to the task: search candidate terms, compare totals, validate coverage, inspect edge cases, or re-read the decisive sources."#;
+Avoid copying the whole context into prose or printing whole document lists. Use short slices and compact projections to inspect structure and evidence. If a subtask requires its own multi-step inspection, use `spawn_agent`; if it is a small direct classification, extraction, summarization, or judgment over supplied data, `llm_query` is enough. Use `start call spawn_agent` plus `await`/`list_async_handles` for parallel fan-out when work is independent. Before finishing, perform one independent check appropriate to the task: search candidate terms, compare totals, validate coverage, inspect edge cases, or re-read the decisive sources."#;
 
 fn build_projected_bindings(
     question: &OolongQuestion,
@@ -1347,7 +1352,7 @@ fn read_env_var(name: &str) -> Option<String> {
 fn turn_completed(outcome: &TurnOutcome) -> bool {
     matches!(
         outcome,
-        TurnOutcome::Finished(_) | TurnOutcome::Handoff { .. }
+        TurnOutcome::Finished(_) | TurnOutcome::AgentFrameSwitch { .. }
     )
 }
 
@@ -1372,7 +1377,7 @@ fn fatal_provider_failure_reason(done_reason: &str, failure_reason: Option<&str>
 
 fn turn_status_label(outcome: &TurnOutcome) -> &'static str {
     match outcome {
-        TurnOutcome::Finished(_) | TurnOutcome::Handoff { .. } => "completed",
+        TurnOutcome::Finished(_) | TurnOutcome::AgentFrameSwitch { .. } => "completed",
         TurnOutcome::Stopped(TurnStop::Cancelled) => "interrupted",
         TurnOutcome::Stopped(_) => "failed",
     }
@@ -1381,9 +1386,9 @@ fn turn_status_label(outcome: &TurnOutcome) -> &'static str {
 fn done_reason_label(outcome: &TurnOutcome) -> &'static str {
     match outcome {
         TurnOutcome::Finished(TurnFinish::AssistantMessage { .. }) => "assistant_message",
-        TurnOutcome::Finished(TurnFinish::SubmittedValue { .. }) => "submitted_value",
+        TurnOutcome::Finished(TurnFinish::FinalValue { .. }) => "final_value",
         TurnOutcome::Finished(TurnFinish::ToolValue { .. }) => "tool_value",
-        TurnOutcome::Handoff { .. } => "handoff",
+        TurnOutcome::AgentFrameSwitch { .. } => "agent_frame_switch",
         TurnOutcome::Stopped(TurnStop::Cancelled) => "cancelled",
         TurnOutcome::Stopped(TurnStop::Incomplete) => "incomplete",
         TurnOutcome::Stopped(TurnStop::InvalidInput) => "invalid_input",
@@ -1450,10 +1455,10 @@ fn aggregate_usage(reports: impl IntoIterator<Item = SessionUsageReport>) -> Ses
         for row in report.by_source_model {
             let key = (row.source.clone(), row.model.clone());
             let entry = total.entry(key).or_default();
-            entry.input_tokens += row.usage.input_tokens;
-            entry.output_tokens += row.usage.output_tokens;
-            entry.cached_input_tokens += row.usage.cached_input_tokens;
-            entry.reasoning_tokens += row.usage.reasoning_tokens;
+            entry.input_tokens += row.usage.usage.input_tokens;
+            entry.output_tokens += row.usage.usage.output_tokens;
+            entry.cache_read_input_tokens += row.usage.usage.cache_read_input_tokens;
+            entry.reasoning_output_tokens += row.usage.usage.reasoning_output_tokens;
         }
     }
     let entries = total
@@ -1755,9 +1760,11 @@ impl OolongEventSink {
 impl EventSink for OolongEventSink {
     async fn emit(&self, event: SessionEvent) {
         match &event {
-            SessionEvent::LlmRequest { mode_iteration, .. } => {
+            SessionEvent::LlmRequest {
+                protocol_iteration, ..
+            } => {
                 if let Ok(mut turns) = self.iteration_count.lock() {
-                    turns.insert(*mode_iteration);
+                    turns.insert(*protocol_iteration);
                 }
                 if let Ok(mut calls) = self.root_llm_calls.lock() {
                     *calls += 1;

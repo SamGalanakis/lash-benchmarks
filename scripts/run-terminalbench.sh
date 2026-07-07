@@ -146,6 +146,24 @@ assert_lash_binary_matches_pin() {
   local actual
   actual="$("${BINARY_PATH}" --version 2>/dev/null | head -n 1 || true)"
   if [[ "${actual}" != *"${expected}"* ]]; then
+    # Recent Lash release tags can still report crate version 0.0.0-dev.
+    # In that case, accept the binary only if it embeds the exact pinned git
+    # commit. This keeps stale binaries from passing while handling publish=false
+    # CLI crates that do not carry the release tag as their crate version.
+    local expected_commit
+    expected_commit=""
+    if [[ -n "${LASH_GIT_REV}" ]]; then
+      expected_commit="${LASH_GIT_REV}"
+    elif command -v git >/dev/null 2>&1; then
+      expected_commit="$(
+        git ls-remote "${LASH_GIT_URL}" "refs/tags/${LASH_GIT_TAG}" 2>/dev/null \
+          | awk 'NR == 1 { print $1 }'
+      )"
+    fi
+    if [[ "${actual}" == *"0.0.0-dev"* && -n "${expected_commit}" ]] \
+      && grep -a -q "${expected_commit:0:8}" "${BINARY_PATH}"; then
+      return 0
+    fi
     cat >&2 <<EOF
 error: lash binary at ${BINARY_PATH} does not match ${LASH_GIT_TAG}.
 Expected version containing '${expected}', got: ${actual:-<no version output>}.
@@ -609,7 +627,7 @@ if [[ -n "${LASH_PROVIDER_KIND}" && "${AGENT}" != "lash" ]]; then
   exit 2
 fi
 
-if [[ -z "${VARIANT}" && "${AGENT}" != "codex" ]]; then
+if [[ -z "${VARIANT}" && "${AGENT}" == "opencode" ]]; then
   echo "error: --variant is required for ${AGENT} benchmark runs" >&2
   exit 2
 fi
